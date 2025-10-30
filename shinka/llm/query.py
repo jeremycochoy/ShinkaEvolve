@@ -193,6 +193,7 @@ def query(
     **kwargs,
 ) -> QueryResult:
     """Query the LLM."""
+    original_model_name = model_name
     client, model_name = get_client_llm(
         model_name, structured_output=output_model is not None
     )
@@ -204,6 +205,8 @@ def query(
         query_fn = query_deepseek
     elif model_name in GEMINI_MODELS.keys():
         query_fn = query_gemini
+    elif original_model_name.start_with('local-'):
+        query_fn = query_openai
     else:
         raise ValueError(f"Model {model_name} not supported.")
     result = query_fn(
