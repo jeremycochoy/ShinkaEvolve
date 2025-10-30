@@ -78,6 +78,27 @@ def get_client_llm(model_name: str, structured_output: bool = False) -> Tuple[An
                 client,
                 mode=instructor.Mode.GEMINI_JSON,
             )
+    elif model_name.startswith("local-"):
+        # Extract URL from model name (format local-ModelName-URL)
+        match = re.match(r"local-(.+?)-(https?://.+)", model_name)
+        if match:
+            model_name = match.group(1)
+            url = match.group(2)
+        else:
+            raise ValueError(f"Invalid local model format: {model_name}")
+
+        # Create OpenAI-compatible client
+        client = openai.OpenAI(
+            api_key="filler",
+            base_url=url
+        )
+
+        # Structured output mode (if required)
+        if structured_output:
+            client = instructor.from_openai(
+                client,
+                mode=instructor.Mode.JSON,
+            )
     else:
         raise ValueError(f"Model {model_name} not supported.")
 
