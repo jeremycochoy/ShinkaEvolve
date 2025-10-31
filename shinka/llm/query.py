@@ -205,7 +205,7 @@ def query(
         query_fn = query_deepseek
     elif model_name in GEMINI_MODELS.keys():
         query_fn = query_gemini
-    elif original_model_name.start_with('local-'):
+    elif original_model_name.startswith('local-'):
         query_fn = query_openai
     else:
         raise ValueError(f"Model {model_name} not supported.")
