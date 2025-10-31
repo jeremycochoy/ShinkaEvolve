@@ -165,6 +165,13 @@ BEDROCK_MODELS = {
     ],
 }
 
+LOCAL_MODELS = {
+    "local": {
+        "input_price": 0.55 / M,
+        "output_price": 2.19 / M,
+    },
+}
+
 REASONING_OAI_MODELS = [
     "o3-mini-2025-01-31",
     "o1-2024-12-17",

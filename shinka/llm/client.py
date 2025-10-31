@@ -3,6 +3,7 @@ import os
 import anthropic
 import openai
 import instructor
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from .models.pricing import (

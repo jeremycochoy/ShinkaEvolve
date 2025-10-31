@@ -1,6 +1,6 @@
 import backoff
 import openai
-from .pricing import OPENAI_MODELS
+from .pricing import OPENAI_MODELS, LOCAL_MODELS
 from .result import QueryResult
 import logging
 
@@ -70,8 +70,10 @@ def query_openai(
             new_content += i[0] + ":" + i[1] + "\n"
         new_msg_history.append({"role": "assistant", "content": new_content})
 
-    input_cost = OPENAI_MODELS[model]["input_price"] * response.usage.input_tokens
-    output_cost = OPENAI_MODELS[model]["output_price"] * response.usage.output_tokens
+    input_price = OPENAI_MODELS.get(model, {}).get("input_price") or LOCAL_MODELS["local"]["input_price"]
+    output_price = OPENAI_MODELS.get(model, {}).get("output_price") or LOCAL_MODELS["local"]["input_price"]
+    input_cost = input_price * response.usage.input_tokens
+    output_cost = output_price * response.usage.output_tokens
     result = QueryResult(
         content=content,
         msg=msg,

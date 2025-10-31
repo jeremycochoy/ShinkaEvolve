@@ -5,6 +5,7 @@ import pandas as pd
 from typing import Union, List, Optional, Tuple
 import numpy as np
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ OPENAI_EMBEDDING_COSTS = {
 GEMINI_EMBEDDING_COSTS = {
     "gemini-embedding-exp-03-07": 0.0 / M,  # Experimental model, often free
     "gemini-embedding-001": 0.0 / M,  # Check current pricing
+}
+
+LOCAL_EMBEDDING_COSTS = {
+    "local": 0.02 / M,
 }
 
 def get_client_model(model_name: str) -> tuple[Union[openai.OpenAI, str], str]:
@@ -144,7 +149,7 @@ class EmbeddingClient:
             if self.model in OPENAI_EMBEDDING_COSTS:
                 cost = response.usage.total_tokens * OPENAI_EMBEDDING_COSTS[self.model]
             elif self.model_name.startswith("local-"):
-                cost = 0.0
+                cost = response.usage.total_tokens * LOCAL_EMBEDDING_COSTS["local"]
             else:
                 raise Exception("Model's embedding cost missing for {model_name}")
             # Extract embedding from response
