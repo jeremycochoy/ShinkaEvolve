@@ -1,6 +1,7 @@
 import backoff
 import openai
-from .pricing import OPENAI_MODELS
+import re
+from .pricing import LOCAL_MODELS
 from .result import QueryResult
 import logging
 
@@ -27,7 +28,7 @@ def backoff_handler(details):
     max_value=20,
     on_backoff=backoff_handler,
 )
-def query_openai(
+def query_local(
     client,
     model,
     msg,
@@ -37,7 +38,7 @@ def query_openai(
     model_posteriors=None,
     **kwargs,
 ) -> QueryResult:
-    """Query OpenAI model."""
+    """Query Local model."""
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
     if output_model is None:
         response = client.responses.create(
@@ -49,10 +50,24 @@ def query_openai(
             **kwargs,
         )
         try:
-            content = response.output[0].content[0].text
+            raw_content = response.output[0].content[0].text
         except Exception:
             # Reasoning models - ResponseOutputMessage
-            content = response.output[1].content[0].text
+            raw_content = response.output[1].content[0].text
+
+        # Extract thinking tokens from <think>...</think> tags
+        think_match = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
+
+        if think_match:
+            thought = think_match.group(1).strip()
+            # Remove the <think> tag from content
+            content = (
+                raw_content[: think_match.start()] + raw_content[think_match.end() :]
+            ).strip()
+        else:
+            thought = ""
+            content = raw_content
+
         new_msg_history.append({"role": "assistant", "content": content})
     else:
         response = client.responses.parse(
@@ -69,9 +84,10 @@ def query_openai(
         for i in content:
             new_content += i[0] + ":" + i[1] + "\n"
         new_msg_history.append({"role": "assistant", "content": new_content})
+        thought = ""
 
-    input_cost = OPENAI_MODELS[model]["input_price"] * response.usage.input_tokens
-    output_cost = OPENAI_MODELS[model]["output_price"] * response.usage.output_tokens
+    input_cost = LOCAL_MODELS["local"]["input_price"] * response.usage.input_tokens
+    output_cost = LOCAL_MODELS["local"]["input_price"] * response.usage.output_tokens
     result = QueryResult(
         content=content,
         msg=msg,
@@ -84,7 +100,7 @@ def query_openai(
         cost=input_cost + output_cost,
         input_cost=input_cost,
         output_cost=output_cost,
-        thought="",
+        thought=thought,
         model_posteriors=model_posteriors,
     )
     return result

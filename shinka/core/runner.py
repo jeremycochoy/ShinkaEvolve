@@ -1085,7 +1085,7 @@ class EvolutionRunner:
                 break  # Break from patch attempts
             else:
                 error_str = (
-                    str(error_attempt) if error_attempt else "No changes applied."
+                    str(error_attempt) if error_attempt else "No changes applied. Make sure your output strictly follows the requested format and syntax, including exact indentation and spacing."
                 )
                 patch_msg = (
                     "The previous edit was not successful."
