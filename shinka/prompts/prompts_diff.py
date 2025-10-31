@@ -1,12 +1,18 @@
 DIFF_SYS_FORMAT = """
-You MUST repond using a edit name, description and the exact SEARCH/REPLACE diff format shown below to indicate changes:
+You must reply using the exact format and rules below.
+Follow everything literally. Do not add extra text, explanations, Markdown code fences, or language tags.
+You MUST repond using a **edit name, description**, and the exact **SEARCH/REPLACE diff format** shown below.
+
+---
+
+#### 🔹 REQUIRED OUTPUT STRUCTURE
 
 <NAME>
-A shortened name summarizing the edit you are proposing. Lowercase, no spaces, underscores allowed.
+Short name for the edited program (lowercase, no spaces, underscores allowed).
 </NAME>
 
 <DESCRIPTION>
-A description and argumentation process of the edit you are proposing.
+Explain and justify the change you are proposing.
 </DESCRIPTION>
 
 <DIFF>
@@ -15,9 +21,28 @@ A description and argumentation process of the edit you are proposing.
 =======
 # New replacement code
 >>>>>>> REPLACE
-
 </DIFF>
 
+---
+
+#### 🔹 RULES (MANDATORY)
+
+1. You may **only** edit code located **between** `EVOLVE-BLOCK-START` and `EVOLVE-BLOCK-END`.
+   Everything outside these markers is **read-only**.
+2. **Never** include the marker lines (`EVOLVE-BLOCK-START` or `EVOLVE-BLOCK-END`) inside your diff.
+3. In the `SEARCH` section, copy the original code **verbatim** — including indentation and spacing.
+4. The `REPLACE` section must contain valid, runnable code.
+
+   * Do **not** wrap it in triple backticks (```) or language labels (e.g., `python`).
+   * Plain text only.
+5. Keep the same **function or class entry point** as the original code so it can still be called correctly from its existing call site.
+6. Maintain identical **inputs and outputs** — you may only change internal logic.
+7. You may propose **multiple edits**; each SEARCH/REPLACE block appears one after another, with **no extra text** between them.
+8. The resulting file must still **run without errors** after applying all changes.
+
+---
+
+#### 🔹 EXAMPLE (CORRECT FORMAT)
 
 Example of a valid diff format:
 <DIFF>
@@ -34,13 +59,86 @@ for i in range(m):
             C[i, j] += A[i, k] * B[k, j]
 >>>>>>> REPLACE
 
-</DIFF>
+<<<<<<< SEARCH
+    total = 0
+    for v in values:
+        total += v
+    return total
+=======
+    # Use NumPy's optimized sum for numerical arrays
+    return np.sum(values)
+>>>>>>> REPLACE
 
-* You may only modify text that lies below a line containing "EVOLVE-BLOCK-START" and above the next "EVOLVE-BLOCK-END". Everything outside those markers is read-only.
-* Do not repeat the markers "EVOLVE-BLOCK-START" and "EVOLVE-BLOCK-END" in the SEARCH/REPLACE blocks.  
-* Every block’s SEARCH section must be copied **verbatim** from the current file.  Including indentation.
-* You can propose multiple independent edits. SEARCH/REPLACE blocks follow one after another. DO NOT ADD ANY OTHER TEXT BETWEEN THESE BLOCKS.
-* Make sure the file still runs after your changes."""
+---
+
+#### ❌ **BAD EXAMPLES (DO NOT DO THIS)**
+
+**1. Using Markdown fences or language tags**
+
+````
+<<<<<<< SEARCH
+```python
+x = foo(bar)
+````
+
+=======
+
+# Avoid repeated work by caching
+
+_cache_key = (bar,)
+if _cache_key in cache:
+x = cache[_cache_key]
+else:
+x = foo(bar)
+cache[_cache_key] = x
+
+> > > > > > > REPLACE
+````
+
+🚫 Wrong: uses ```python``` and code fences, use spaces between each greater-than sign in.
+
+---
+
+**2. Breaking the entry point**
+
+````
+<<<<<<< SEARCH
+def process_data(data):
+    return transform(data)
+======================
+
+def new_function_name(data):  # ❌ entry point renamed
+    return transform(data)
+>>>>>>> REPLACE
+```
+
+🚫 Wrong: changed the callable name — breaks the call site.  
+
+---
+
+**3. Editing outside EVOLVE blocks or altering markers**
+
+```
+<<<<<<< SEARCH
+EVOLVE-BLOCK-START
+def compute_total(values):
+    total = 0
+    for v in values:
+        total += v
+    return total
+EVOLVE-BLOCK-END
+=======
+# ❌ Wrong: EVOLVE markers must not appear inside your diff
+EVOLVE-BLOCK-START
+def compute_total(values):
+    return sum(values)
+EVOLVE-BLOCK-END
+>>>>>>> REPLACE
+```
+
+🚫 Wrong: EVOLVE markets appear inside the diff.
+
+"""
 
 
 DIFF_ITER_MSG = """# Current program
