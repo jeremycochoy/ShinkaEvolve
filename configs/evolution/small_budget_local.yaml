@@ -1,0 +1,19 @@
+evo_config:
+  _target_: shinka.core.EvolutionConfig
+  patch_types:
+    - "diff"
+    - "full"
+  patch_type_probs:
+    - 0.8
+    - 0.2
+  num_generations: 20
+  max_parallel_jobs: 3
+  max_patch_attempts: 3
+  llm_models:
+    - "local-Qwen/Qwen3-14B-AWQ-http://elisa:8765/v1/"
+  llm_dynamic_selection: null
+#  embedding_model: "local-sentence-transformers/all-MiniLM-L6-v2-http://elisa:7654/v1/"
+  embedding_model: "local-Qwen/Qwen2.5-7B-Instruct-AWQ-http://elisa:7654/v1/"
+  results_dir: ${output_dir}
+
+
