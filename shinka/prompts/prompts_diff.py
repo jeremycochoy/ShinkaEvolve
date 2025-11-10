@@ -1,7 +1,7 @@
 DIFF_SYS_FORMAT = """
 You must reply using the exact format and rules below.
 Follow everything literally. Do not add extra text, explanations, Markdown code fences, or language tags.
-You MUST repond using a **edit name, description**, and the exact **SEARCH/REPLACE diff format** shown below.
+You MUST repond using a **edit name**, a **description**, and the exact **SEARCH/REPLACE diff format** shown below.
 
 ---
 
@@ -27,18 +27,19 @@ Explain and justify the change you are proposing.
 
 #### 🔹 RULES (MANDATORY)
 
-1. You may **only** edit code located **between** `EVOLVE-BLOCK-START` and `EVOLVE-BLOCK-END`.
+1. Do not forget opening / closing tags.
+2. You may **only** edit code located **between** `EVOLVE-BLOCK-START` and `EVOLVE-BLOCK-END`.
    Everything outside these markers is **read-only**.
-2. **Never** include the marker lines (`EVOLVE-BLOCK-START` or `EVOLVE-BLOCK-END`) inside your diff.
-3. In the `SEARCH` section, copy the original code **verbatim** — including indentation and spacing.
-4. The `REPLACE` section must contain valid, runnable code.
+3. **Never** include the marker lines (`EVOLVE-BLOCK-START` or `EVOLVE-BLOCK-END`) inside your diff.
+4. In the `SEARCH` section, copy the original code **verbatim** — including indentation and spacing.
+5. The `REPLACE` section must contain valid, runnable code.
 
    * Do **not** wrap it in triple backticks (```) or language labels (e.g., `python`).
    * Plain text only.
-5. Keep the same **function or class entry point** as the original code so it can still be called correctly from its existing call site.
-6. Maintain identical **inputs and outputs** — you may only change internal logic.
-7. You may propose **multiple edits**; each SEARCH/REPLACE block appears one after another, with **no extra text** between them.
-8. The resulting file must still **run without errors** after applying all changes.
+6. Keep the same **function or class entry point** as the original code so it can still be called correctly from its existing call site.
+7. Maintain identical **inputs and outputs** — you may only change internal logic.
+8. You may propose **multiple edits**; each SEARCH/REPLACE block appears one after another, with **no extra text** between them.
+9. The resulting file must still **run without errors** after applying all changes.
 
 ---
 
