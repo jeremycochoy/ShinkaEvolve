@@ -15,5 +15,3 @@ evo_config:
 #  embedding_model: "local-sentence-transformers/all-MiniLM-L6-v2-http://elisa:7654/v1/"
   embedding_model: "local-Qwen/Qwen2.5-7B-Instruct-AWQ-http://elisa:7654/v1/"
   results_dir: ${output_dir}
-
-
