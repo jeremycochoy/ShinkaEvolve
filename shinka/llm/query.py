@@ -116,7 +116,7 @@ def sample_model_kwargs(
     if kwargs_dict["model_name"] in (
         REASONING_OAI_MODELS
         + REASONING_CLAUDE_MODELS
-        + REASONING_DEEPSEEK_MODELS
+        # + REASONING_DEEPSEEK_MODELS
         + REASONING_GEMINI_MODELS
         + REASONING_AZURE_MODELS
         + REASONING_BEDROCK_MODELS
