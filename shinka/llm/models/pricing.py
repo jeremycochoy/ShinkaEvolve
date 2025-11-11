@@ -167,8 +167,8 @@ BEDROCK_MODELS = {
 
 LOCAL_MODELS = {
     "local": {
-        "input_price": 0.55 / M,
-        "output_price": 2.19 / M,
+        "input_price": 0.28 / M,
+        "output_price": 0.42 / M,
     },
 }
 
