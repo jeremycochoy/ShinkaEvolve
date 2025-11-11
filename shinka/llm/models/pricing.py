@@ -123,12 +123,12 @@ OPENAI_MODELS = {
 
 DEEPSEEK_MODELS = {
     "deepseek-chat": {
-        "input_price": 0.27 / M,
-        "output_price": 1.1 / M,
+        "input_price": 0.28 / M,
+        "output_price": 0.42 / M,
     },
     "deepseek-reasoner": {
-        "input_price": 0.55 / M,
-        "output_price": 2.19 / M,
+        "input_price": 0.28 / M,
+        "output_price": 0.42 / M,
     },
 }
 

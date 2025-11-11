@@ -27,7 +27,7 @@ Explain and justify the change you are proposing.
 
 #### 🔹 RULES (MANDATORY)
 
-1. Do not forget opening / closing tags.
+1. Do not forget opening (ex: <NAME>) and closing tags (ex: </NAME>).
 2. You may **only** edit code located **between** `EVOLVE-BLOCK-START` and `EVOLVE-BLOCK-END`.
    Everything outside these markers is **read-only**.
 3. **Never** include the marker lines (`EVOLVE-BLOCK-START` or `EVOLVE-BLOCK-END`) inside your diff.
