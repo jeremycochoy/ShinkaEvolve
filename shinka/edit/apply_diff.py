@@ -697,13 +697,13 @@ def apply_diff_patch(
     # Strip trailing whitespace from patch text
     patch_str = _strip_trailing_whitespace(patch_str)
 
-    # Remove the EVOLVE-BLOCK START and EVOLVE-BLOCK END markers
+    # Remove the EVOLVE-BLOCK-START and EVOLVE-BLOCK-END markers
     if language in ["cuda", "cpp", "rust", "json", "json5"]:
-        patch_str = re.sub(r"// EVOLVE-BLOCK START\\n", "", patch_str)
-        patch_str = re.sub(r"// EVOLVE-BLOCK END\\n", "", patch_str)
+        patch_str = re.sub(r"// EVOLVE-BLOCK-START\\n", "", patch_str)
+        patch_str = re.sub(r"// EVOLVE-BLOCK-END\\n", "", patch_str)
     elif language == "python":
-        patch_str = re.sub(r"# EVOLVE-BLOCK START\\n", "", patch_str)
-        patch_str = re.sub(r"# EVOLVE-BLOCK END\\n", "", patch_str)
+        patch_str = re.sub(r"# EVOLVE-BLOCK-START\\n", "", patch_str)
+        patch_str = re.sub(r"# EVOLVE-BLOCK-END\\n", "", patch_str)
     else:
         raise ValueError(f"Language {language} not supported")
 
