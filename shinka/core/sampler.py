@@ -28,6 +28,7 @@ class PromptSampler:
         patch_types: Optional[List[str]] = None,
         patch_type_probs: Optional[List[float]] = None,
         use_text_feedback: bool = False,
+        extra_documentation: Optional[str] = None,
     ):
         if patch_types is None:
             patch_types = ["diff"]
@@ -46,6 +47,7 @@ class PromptSampler:
             )
         # Whether to use text feedback in the prompt
         self.use_text_feedback = use_text_feedback
+        self.extra_documentation = extra_documentation
 
     def initial_program_prompt(self) -> Tuple[str, str]:
         """Generate the prompt for the initial program."""
@@ -174,8 +176,14 @@ class PromptSampler:
             )
             sum_rec_msg += f"\n{meta_recommendations}"
 
+        # Add extra documentation if provided (for diff, cross, and full rewrite)
+        doc_section = ""
+        if self.extra_documentation is not None:
+            doc_section = "\n\n# Additional Documentation\n\n"
+            doc_section += self.extra_documentation
+
         return (
             sys_msg + sum_rec_msg,
-            eval_history_msg + "\n" + iter_msg,
+            eval_history_msg + "\n" + iter_msg + doc_section,
             patch_type,
         )

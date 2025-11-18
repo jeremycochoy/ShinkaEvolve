@@ -62,6 +62,7 @@ class EvolutionConfig:
     novelty_llm_models: Optional[List[str]] = None
     novelty_llm_kwargs: dict = field(default_factory=lambda: {})
     use_text_feedback: bool = False
+    extra_documentation_path: Optional[str] = None
 
 
 @dataclass
@@ -202,6 +203,17 @@ class EvolutionRunner:
         else:
             self.novelty_llm = None
 
+        # Load extra documentation if provided
+        extra_documentation = None
+        if evo_config.extra_documentation_path is not None:
+            doc_path = Path(evo_config.extra_documentation_path)
+            if doc_path.exists():
+                extra_documentation = doc_path.read_text()
+            else:
+                logger.warning(
+                    f"Extra documentation path not found: {evo_config.extra_documentation_path}"
+                )
+
         # Initialize PromptSampler for handling LLM code prompts
         self.prompt_sampler = PromptSampler(
             task_sys_msg=evo_config.task_sys_msg,
@@ -209,6 +221,7 @@ class EvolutionRunner:
             patch_types=evo_config.patch_types,
             patch_type_probs=evo_config.patch_type_probs,
             use_text_feedback=evo_config.use_text_feedback,
+            extra_documentation=extra_documentation,
         )
 
         # Initialize MetaSummarizer for meta-recommendations
