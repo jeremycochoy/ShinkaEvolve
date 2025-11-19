@@ -122,6 +122,10 @@ OPENAI_MODELS = {
         "input_price": 1.25 / M,
         "output_price": 10.0 / M,
     },
+    "gpt-5.1-codex": {
+        "input_price": 1.25 / M,
+        "output_price": 10.0 / M,
+    },
 }
 
 
@@ -190,6 +194,7 @@ REASONING_OAI_MODELS = [
     "gpt-5",
     "gpt-5-mini",
     "gpt-5-nano",
+    "gpt-5.1-codex",
 ]
 
 REASONING_CLAUDE_MODELS = [
