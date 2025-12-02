@@ -185,6 +185,10 @@ LOCAL_MODELS = {
 }
 
 OPENROUTER_MODELS = {
+    "qwen/qwen3-14b": {
+        "input_price": 0.05 / M,
+        "output_price": 0.22 / M,
+    },
     "qwen/qwen3-32b": {
         "input_price": 0.08 / M,
         "output_price": 0.24 / M,
