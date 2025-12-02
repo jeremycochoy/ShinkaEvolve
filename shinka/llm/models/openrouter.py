@@ -1,7 +1,7 @@
 import backoff
 import openai
 import re
-from .pricing import OPENROUTER_MODELS
+from .pricing import OPENROUTER_MODELS, REASONING_OPENROUTER_MODELS
 from .result import QueryResult
 import logging
 
@@ -49,23 +49,37 @@ def query_openrouter(
             ],
             **kwargs,
         )
-        try:
-            raw_content = response.output[0].content[0].text
-        except Exception:
-            # Reasoning models - ResponseOutputMessage
-            raw_content = response.output[1].content[0].text
 
-        # Extract thinking tokens from <think>...</think> tags
+        # Check if this is a reasoning model
+        if model in REASONING_OPENROUTER_MODELS:
+            # For reasoning models: output[0] = thinking, output[1] = answer
+            try:
+                thought = response.output[0].content[0].text
+            except (IndexError, AttributeError):
+                thought = ""
+
+            try:
+                raw_content = response.output[1].content[0].text
+            except (IndexError, AttributeError):
+                # Fallback to output[0] if output[1] doesn't exist
+                raw_content = response.output[0].content[0].text
+                thought = ""
+        else:
+            # For regular models: output[0] = answer
+            raw_content = response.output[0].content[0].text
+            thought = ""
+
+        # Also extract thinking from <think>...</think> tags if present
         think_match = re.search(r"<think>(.*?)</think>", raw_content, re.DOTALL)
 
         if think_match:
+            # If we found <think> tags, use that as thought (overriding any previous thought)
             thought = think_match.group(1).strip()
             # Remove the <think> tag from content
             content = (
                 raw_content[: think_match.start()] + raw_content[think_match.end() :]
             ).strip()
         else:
-            thought = ""
             content = raw_content
 
         new_msg_history.append({"role": "assistant", "content": content})

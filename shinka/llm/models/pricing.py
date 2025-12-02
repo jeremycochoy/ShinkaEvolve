@@ -251,5 +251,6 @@ REASONING_BEDROCK_MODELS = [
 ]
 
 REASONING_OPENROUTER_MODELS = [
+    "qwen/qwen3-32b",
     "qwen/qwen3-30b-a3b-thinking-2507",
 ]

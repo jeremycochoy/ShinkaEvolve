@@ -308,16 +308,14 @@ def test_openrouter_thinking_model():
         system_msg=system_msg,
         msg_history=[],
         temperature=1.0,
-        max_output_tokens=200,
+        max_output_tokens=2000,  # Increased to allow both reasoning and answer
     )
 
     assert result is not None, "Query result is None"
     assert result.content, "Response content is empty"
     assert hasattr(result, "thought"), "Result missing thought attribute"
 
-    # For thinking models, we expect either:
-    # 1. Thinking in the <think> tags (which gets extracted to thought field)
-    # 2. Or the model doesn't use <think> tags and thought is empty
+    # For reasoning models, we expect both thinking and answer
     print(f"\nThinking Model Response:")
     print(f"  Content: {result.content[:200]}...")
     print(f"  Thought: {result.thought[:200] if result.thought else '(empty)'}...")
@@ -327,6 +325,42 @@ def test_openrouter_thinking_model():
 
     # Verify the answer is correct
     assert "12" in result.content, f"Model didn't provide correct answer. Response: {result.content}"
+
+    # Verify thinking was captured
+    assert result.thought, "Thinking tokens were not captured for reasoning model"
+
+
+def test_openrouter_qwen3_32b_reasoning():
+    """Test that qwen3-32b properly separates reasoning from answer."""
+    model_name = "openrouter-qwen/qwen3-32b"
+
+    msg = "What is 8 * 9?"
+    system_msg = "You are a helpful assistant."
+
+    result = query(
+        model_name=model_name,
+        msg=msg,
+        system_msg=system_msg,
+        msg_history=[],
+        temperature=1.0,
+        max_output_tokens=2000,
+    )
+
+    assert result is not None, "Query result is None"
+    assert result.content, "Response content is empty"
+
+    # For reasoning models, we expect both thinking and answer
+    print(f"\nQwen3-32B Reasoning Model Response:")
+    print(f"  Content: {result.content[:200]}...")
+    print(f"  Thought: {result.thought[:200] if result.thought else '(empty)'}...")
+    print(f"  Input tokens: {result.input_tokens}")
+    print(f"  Output tokens: {result.output_tokens}")
+
+    # Verify the answer is correct
+    assert "72" in result.content, f"Model didn't provide correct answer. Response: {result.content}"
+
+    # Verify thinking was captured
+    assert result.thought, "Thinking tokens were not captured for qwen3-32b reasoning model"
 
 
 if __name__ == "__main__":
