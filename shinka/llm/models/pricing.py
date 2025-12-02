@@ -184,6 +184,21 @@ LOCAL_MODELS = {
     },
 }
 
+OPENROUTER_MODELS = {
+    "qwen/qwen3-32b": {
+        "input_price": 0.08 / M,
+        "output_price": 0.24 / M,
+    },
+    "qwen/qwen3-coder-30b-a3b-instruct": {
+        "input_price": 0.06 / M,
+        "output_price": 0.25 / M,
+    },
+    "qwen/qwen3-30b-a3b": {
+        "input_price": 0.06 / M,
+        "output_price": 0.22 / M,
+    },
+}
+
 REASONING_OAI_MODELS = [
     "o3-mini-2025-01-31",
     "o1-2024-12-17",

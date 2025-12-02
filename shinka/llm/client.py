@@ -12,6 +12,7 @@ from .models.pricing import (
     OPENAI_MODELS,
     DEEPSEEK_MODELS,
     GEMINI_MODELS,
+    OPENROUTER_MODELS,
 )
 
 env_path = Path(__file__).parent.parent.parent / ".env"
@@ -92,6 +93,22 @@ def get_client_llm(model_name: str, structured_output: bool = False) -> Tuple[An
         client = openai.OpenAI(
             api_key="filler",
             base_url=url
+        )
+
+        # Structured output mode (if required)
+        if structured_output:
+            client = instructor.from_openai(
+                client,
+                mode=instructor.Mode.JSON,
+            )
+    elif model_name.startswith("openrouter-"):
+        # Extract model name from model name (format openrouter-qwen/qwen3-32b)
+        model_name = model_name.replace("openrouter-", "")
+
+        # Create OpenAI-compatible client for OpenRouter
+        client = openai.OpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url="https://openrouter.ai/api/v1"
         )
 
         # Structured output mode (if required)

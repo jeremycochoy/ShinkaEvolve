@@ -21,6 +21,7 @@ from .models import (
     query_deepseek,
     query_gemini,
     query_local,
+    query_openrouter,
     QueryResult,
 )
 import logging
@@ -208,6 +209,8 @@ def query(
         query_fn = query_gemini
     elif original_model_name.startswith('local-'):
         query_fn = query_local
+    elif original_model_name.startswith('openrouter-'):
+        query_fn = query_openrouter
     else:
         raise ValueError(f"Model {model_name} not supported.")
     result = query_fn(
