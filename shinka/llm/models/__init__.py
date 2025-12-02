@@ -3,6 +3,7 @@ from .openai import query_openai
 from .deepseek import query_deepseek
 from .gemini import query_gemini
 from .local import query_local
+from .openrouter import query_openrouter
 from .result import QueryResult
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "query_deepseek",
     "query_gemini",
     "query_local",
+    "query_openrouter",
     "QueryResult",
 ]
