@@ -14,6 +14,7 @@ from .models.pricing import (
     REASONING_GEMINI_MODELS,
     REASONING_AZURE_MODELS,
     REASONING_BEDROCK_MODELS,
+    REASONING_OPENROUTER_MODELS,
 )
 from .models import (
     query_anthropic,
@@ -121,6 +122,7 @@ def sample_model_kwargs(
         + REASONING_GEMINI_MODELS
         + REASONING_AZURE_MODELS
         + REASONING_BEDROCK_MODELS
+        # + REASONING_OPENROUTER_MODELS  # OpenRouter uses config temperature
     ):
         kwargs_dict["temperature"] = 1.0
     else:

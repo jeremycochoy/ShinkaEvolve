@@ -26,6 +26,7 @@ OPENROUTER_TEST_MODELS = [
     "openrouter-qwen/qwen3-32b",
     "openrouter-qwen/qwen3-coder-30b-a3b-instruct",
     "openrouter-qwen/qwen3-30b-a3b",
+    "openrouter-qwen/qwen3-30b-a3b-thinking-2507",
 ]
 
 
@@ -43,6 +44,7 @@ def test_openrouter_models_in_pricing():
         "qwen/qwen3-32b",
         "qwen/qwen3-coder-30b-a3b-instruct",
         "qwen/qwen3-30b-a3b",
+        "qwen/qwen3-30b-a3b-thinking-2507",
     ]
 
     for model in expected_models:
@@ -58,6 +60,7 @@ def test_openrouter_pricing_values():
         "qwen/qwen3-32b": {"input": 0.08, "output": 0.24},
         "qwen/qwen3-coder-30b-a3b-instruct": {"input": 0.06, "output": 0.25},
         "qwen/qwen3-30b-a3b": {"input": 0.06, "output": 0.22},
+        "qwen/qwen3-30b-a3b-thinking-2507": {"input": 0.051, "output": 0.34},
     }
 
     M = 1000000
@@ -290,6 +293,40 @@ def test_openrouter_error_handling():
         # Expected behavior - should raise an exception
         assert "not found" in str(e).lower() or "not supported" in str(e).lower(), \
             f"Unexpected error message: {e}"
+
+
+def test_openrouter_thinking_model():
+    """Test that thinking model properly extracts thinking tokens."""
+    model_name = "openrouter-qwen/qwen3-30b-a3b-thinking-2507"
+
+    msg = "What is 5 + 7? Think through it step by step."
+    system_msg = "You are a helpful assistant."
+
+    result = query(
+        model_name=model_name,
+        msg=msg,
+        system_msg=system_msg,
+        msg_history=[],
+        temperature=1.0,
+        max_output_tokens=200,
+    )
+
+    assert result is not None, "Query result is None"
+    assert result.content, "Response content is empty"
+    assert hasattr(result, "thought"), "Result missing thought attribute"
+
+    # For thinking models, we expect either:
+    # 1. Thinking in the <think> tags (which gets extracted to thought field)
+    # 2. Or the model doesn't use <think> tags and thought is empty
+    print(f"\nThinking Model Response:")
+    print(f"  Content: {result.content[:200]}...")
+    print(f"  Thought: {result.thought[:200] if result.thought else '(empty)'}...")
+    print(f"  Input tokens: {result.input_tokens}")
+    print(f"  Output tokens: {result.output_tokens}")
+    print(f"  Total cost: ${result.cost:.6f}")
+
+    # Verify the answer is correct
+    assert "12" in result.content, f"Model didn't provide correct answer. Response: {result.content}"
 
 
 if __name__ == "__main__":

@@ -197,6 +197,10 @@ OPENROUTER_MODELS = {
         "input_price": 0.06 / M,
         "output_price": 0.22 / M,
     },
+    "qwen/qwen3-30b-a3b-thinking-2507": {
+        "input_price": 0.051 / M,
+        "output_price": 0.34 / M,
+    },
 }
 
 REASONING_OAI_MODELS = [
@@ -240,4 +244,8 @@ REASONING_AZURE_MODELS = [
 REASONING_BEDROCK_MODELS = [
     "bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
     "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0",
+]
+
+REASONING_OPENROUTER_MODELS = [
+    "qwen/qwen3-30b-a3b-thinking-2507",
 ]
