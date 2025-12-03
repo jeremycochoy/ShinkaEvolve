@@ -363,6 +363,46 @@ def test_openrouter_qwen3_32b_reasoning():
     assert result.thought, "Thinking tokens were not captured for qwen3-32b reasoning model"
 
 
+def test_openrouter_qwen3_30b_a3b_thinking():
+    """Test that qwen3-30b-a3b properly extracts both thinking and answer."""
+    model_name = "openrouter-qwen/qwen3-30b-a3b"
+
+    msg = "What is 15 * 7? Think through it step by step."
+    system_msg = "You are a helpful assistant."
+
+    result = query(
+        model_name=model_name,
+        msg=msg,
+        system_msg=system_msg,
+        msg_history=[],
+        temperature=1.0,
+        max_output_tokens=2000,  # Allow space for both thinking and answer
+    )
+
+    assert result is not None, "Query result is None"
+    assert result.content, "Response content is empty"
+    assert hasattr(result, "thought"), "Result missing thought attribute"
+
+    # For reasoning models, we expect both thinking and answer
+    print(f"\nQwen3-30B-A3B Thinking Model Response:")
+    print(f"  Content: {result.content[:200]}...")
+    print(f"  Thought: {result.thought[:200] if result.thought else '(empty)'}...")
+    print(f"  Input tokens: {result.input_tokens}")
+    print(f"  Output tokens: {result.output_tokens}")
+    print(f"  Total cost: ${result.cost:.6f}")
+
+    # Verify the answer is correct
+    assert "105" in result.content, f"Model didn't provide correct answer. Response: {result.content}"
+
+    # Verify thinking was captured
+    assert result.thought, "Thinking tokens were not captured for qwen3-30b-a3b reasoning model"
+    assert len(result.thought) > 0, "Thinking content is empty"
+
+    # Verify both thinking and answer are separated
+    print(f"\n  Full Thought ({len(result.thought)} chars): {result.thought}")
+    print(f"  Full Content ({len(result.content)} chars): {result.content}")
+
+
 if __name__ == "__main__":
     # Run tests with verbose output
     pytest.main([__file__, "-v", "-s"])
