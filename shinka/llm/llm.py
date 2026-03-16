@@ -766,7 +766,7 @@ def extract_between(
     Returns:
         str: The extracted text, or None if no text is found
     """
-    match = re.search(f"{start}\\s*(.*?)\\s*{end}", content, re.DOTALL)
+    match = re.search(f"{start}\\s*(.*?)(?:{end}|(?=\\s*<[A-Za-z]+>))", content, re.DOTALL)
     if match:
         matched_str = match.group(1).strip()
         if return_dict:
