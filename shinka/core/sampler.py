@@ -36,6 +36,7 @@ class PromptSampler:
         inspiration_sort_order: Literal[
             "ascending", "chronological", "none"
         ] = "ascending",
+        extra_documentation: Optional[str] = None,
     ):
         if patch_types is None:
             patch_types = default_patch_types()
@@ -58,6 +59,7 @@ class PromptSampler:
         self.context_builder = InspirationContextBuilder(
             sort_order=inspiration_sort_order
         )
+        self.extra_documentation = extra_documentation
 
     def initial_program_prompt(self) -> Tuple[str, str]:
         """Generate the prompt for the initial program."""
@@ -202,9 +204,14 @@ class PromptSampler:
         else:
             raise ValueError(f"Invalid patch type: {patch_type}")
 
+        doc_section = ""
+        if self.extra_documentation is not None:
+            doc_section = "\n\n# Additional Documentation\n\n"
+            doc_section += self.extra_documentation
+
         return (
             sys_msg,
-            eval_history_msg + "\n" + iter_msg,
+            eval_history_msg + "\n" + iter_msg + doc_section,
             patch_type,
         )
 
