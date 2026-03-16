@@ -39,6 +39,7 @@ class EvolutionConfig:
     sample_single_meta_rec: bool = True
     embedding_model: Optional[str] = "text-embedding-3-small"
     init_program_path: Optional[str] = "initial.py"
+    extra_documentation_path: Optional[str] = None
     results_dir: Optional[str] = None
     max_novelty_attempts: int = 3
     code_embed_sim_threshold: float = 0.99

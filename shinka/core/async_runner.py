@@ -399,6 +399,16 @@ class ShinkaEvolveRunner:
             job_type=evo_config.job_type, config=job_config, verbose=verbose
         )
 
+        # Load extra documentation if path is provided
+        extra_documentation = None
+        if evo_config.extra_documentation_path:
+            doc_path = Path(evo_config.extra_documentation_path)
+            if doc_path.exists():
+                extra_documentation = doc_path.read_text()
+                logger.info(f"Loaded extra documentation from {doc_path}")
+            else:
+                logger.warning(f"Extra documentation path not found: {doc_path}")
+
         # Prompt sampler
         self.prompt_sampler = PromptSampler(
             task_sys_msg=evo_config.task_sys_msg,
@@ -407,6 +417,7 @@ class ShinkaEvolveRunner:
             patch_type_probs=evo_config.patch_type_probs,
             use_text_feedback=evo_config.use_text_feedback,
             inspiration_sort_order=evo_config.inspiration_sort_order,
+            extra_documentation=extra_documentation,
         )
 
         # Meta summarizer (create both sync and async versions)
