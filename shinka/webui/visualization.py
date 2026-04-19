@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 from shinka.database import DatabaseConfig, ProgramDatabase
@@ -40,9 +41,226 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.search_root = search_root or os.getcwd()
         super().__init__(*args, **kwargs)
 
+    def end_headers(self):
+        """Disable browser caching for local HTML shells to avoid stale embedded JS."""
+        parsed_url = urllib.parse.urlparse(self.path)
+        if parsed_url.path in ("/", "/index.html", "/viz_tree.html", "/compare.html"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def log_message(self, format, *args):
         """Override to provide more detailed logging."""
         print(f"\n[SERVER] {format % args}")
+
+    def _make_failed_node_id(self, generation: int) -> str:
+        return f"failed:proposal:{generation}"
+
+    def _parse_failed_node_generation(self, node_id: str) -> Optional[int]:
+        prefix = "failed:proposal:"
+        if not node_id.startswith(prefix):
+            return None
+        try:
+            return int(node_id[len(prefix) :])
+        except ValueError:
+            return None
+
+    def _read_failure_json(
+        self, failure_json_path: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not failure_json_path:
+            return None
+        try:
+            failure_path = Path(self.search_root) / failure_json_path
+            if not failure_path.exists():
+                return None
+            return json.loads(failure_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _language_from_suffix(self, suffix: str) -> str:
+        ext = suffix.lstrip(".").lower()
+        return {
+            "py": "python",
+            "js": "javascript",
+            "ts": "typescript",
+            "cpp": "cpp",
+            "cc": "cpp",
+            "cxx": "cpp",
+            "cu": "cuda",
+        }.get(ext, ext or "python")
+
+    def _resolve_failed_node_language(
+        self,
+        details: Dict[str, Any],
+        failure_payload: Optional[Dict[str, Any]],
+    ) -> str:
+        for source in (failure_payload or {}, details):
+            language = source.get("language")
+            if language:
+                return str(language)
+
+        generated_code_path = ((failure_payload or {}).get("artifacts", {}) or {}).get(
+            "generated_code_path"
+        )
+        if generated_code_path:
+            return self._language_from_suffix(Path(generated_code_path).suffix)
+
+        failure_json_path = details.get("failure_json_path")
+        if failure_json_path:
+            failure_path = Path(self.search_root) / failure_json_path
+            candidates = sorted(failure_path.parent.glob("main.*"))
+            if candidates:
+                return self._language_from_suffix(candidates[0].suffix)
+
+        return "python"
+
+    def _resolve_failed_node_code_path(
+        self,
+        details: Dict[str, Any],
+        failure_payload: Optional[Dict[str, Any]],
+    ) -> Optional[Path]:
+        generated_code_path = ((failure_payload or {}).get("artifacts", {}) or {}).get(
+            "generated_code_path"
+        )
+        if generated_code_path:
+            code_path = Path(self.search_root) / generated_code_path
+            if code_path.exists():
+                return code_path
+
+        failure_json_path = details.get("failure_json_path")
+        if not failure_json_path:
+            return None
+
+        failure_path = Path(self.search_root) / failure_json_path
+        language = self._resolve_failed_node_language(details, failure_payload)
+        preferred_suffix = {
+            "python": ".py",
+            "javascript": ".js",
+            "typescript": ".ts",
+            "cpp": ".cpp",
+            "cuda": ".cu",
+        }.get(language)
+        if preferred_suffix:
+            preferred_path = failure_path.parent / f"main{preferred_suffix}"
+            if preferred_path.exists():
+                return preferred_path
+
+        candidates = sorted(failure_path.parent.glob("main.*"))
+        return candidates[0] if candidates else None
+
+    def _build_failed_node_dict(
+        self,
+        *,
+        generation: int,
+        created_at: float,
+        details: Dict[str, Any],
+        include_code: bool = False,
+    ) -> Dict[str, Any]:
+        failure_json_path = details.get("failure_json_path")
+        failure_payload = self._read_failure_json(failure_json_path)
+        metadata = dict(details)
+        if failure_payload:
+            for key in [
+                "failure_json_path",
+                "language",
+                "generated_code_available",
+                "downstream_eval_submitted",
+                "artifacts",
+                "attempts",
+                "api_costs",
+                "embed_cost",
+                "novelty_cost",
+                "novelty_explanation",
+                "max_similarity",
+            ]:
+                if key in failure_payload:
+                    metadata[key] = failure_payload[key]
+
+        language = self._resolve_failed_node_language(details, failure_payload)
+        code = None
+        if include_code and failure_payload:
+            code_path = self._resolve_failed_node_code_path(details, failure_payload)
+            if code_path is not None:
+                try:
+                    code = code_path.read_text(encoding="utf-8")
+                except Exception:
+                    code = None
+
+        return {
+            "id": self._make_failed_node_id(generation),
+            "code": code,
+            "language": language,
+            "parent_id": details.get("parent_id"),
+            "archive_inspiration_ids": details.get("archive_inspiration_ids") or [],
+            "top_k_inspiration_ids": details.get("top_k_inspiration_ids") or [],
+            "island_idx": None,
+            "generation": generation,
+            "timestamp": created_at,
+            "code_diff": None,
+            "combined_score": 0.0,
+            "public_metrics": {},
+            "private_metrics": {},
+            "text_feedback": details.get("failure_reason", ""),
+            "correct": False,
+            "children_count": 0,
+            "complexity": 0.0,
+            "embedding": [],
+            "embedding_pca_2d": [],
+            "embedding_pca_3d": [],
+            "embedding_cluster_id": None,
+            "migration_history": [],
+            "metadata": metadata,
+            "in_archive": False,
+            "system_prompt_id": metadata.get("system_prompt_id"),
+        }
+
+    def _load_failed_proposal_nodes(
+        self,
+        abs_db_path: str,
+        *,
+        include_code: bool = False,
+        generation: Optional[int] = None,
+    ) -> list[Dict[str, Any]]:
+        conn = sqlite3.connect(abs_db_path, timeout=5.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA busy_timeout = 5000;")
+            query = """
+                SELECT generation, details, created_at
+                FROM attempt_log
+                WHERE status = 'failed'
+                  AND json_valid(details)
+                  AND json_extract(details, '$.node_kind') = 'failed_proposal'
+            """
+            params: list[Any] = []
+            if generation is not None:
+                query += " AND generation = ?"
+                params.append(generation)
+            query += " ORDER BY generation ASC, created_at DESC, id DESC"
+            cursor.execute(query, params)
+
+            selected: Dict[int, Dict[str, Any]] = {}
+            for row in cursor.fetchall():
+                gen = int(row["generation"])
+                if gen in selected:
+                    continue
+                try:
+                    details = json.loads(row["details"])
+                except json.JSONDecodeError:
+                    continue
+                selected[gen] = self._build_failed_node_dict(
+                    generation=gen,
+                    created_at=float(row["created_at"]),
+                    details=details,
+                    include_code=include_code,
+                )
+
+            return [selected[g] for g in sorted(selected)]
+        finally:
+            conn.close()
 
     def do_GET(self):
         print(f"\n[SERVER] Received GET request for: {self.path}")
@@ -74,19 +292,23 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
             db_path = query["db_path"][0]
             return self.handle_get_meta_files(db_path)
 
-        if path == "/get_meta_content" and "db_path" in query and "generation" in query:
+        if (
+            path == "/get_meta_content"
+            and "db_path" in query
+            and ("processed_count" in query or "generation" in query)
+        ):
             db_path = query["db_path"][0]
-            generation = query["generation"][0]
-            return self.handle_get_meta_content(db_path, generation)
+            processed_count = query.get("processed_count", query.get("generation"))[0]
+            return self.handle_get_meta_content(db_path, processed_count)
 
         if (
             path == "/download_meta_pdf"
             and "db_path" in query
-            and "generation" in query
+            and ("processed_count" in query or "generation" in query)
         ):
             db_path = query["db_path"][0]
-            generation = query["generation"][0]
-            return self.handle_download_meta_pdf(db_path, generation)
+            processed_count = query.get("processed_count", query.get("generation"))[0]
+            return self.handle_download_meta_pdf(db_path, processed_count)
 
         if (
             path == "/get_plots"
@@ -235,15 +457,19 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 # Set WAL mode compatible settings for read-only connections
                 # Longer busy_timeout for concurrent access during evolution
                 if db.cursor:
-                    db.cursor.execute(
-                        "PRAGMA busy_timeout = 30000;"
-                    )  # 30 second timeout
-                    db.cursor.execute("PRAGMA journal_mode = WAL;")  # Ensure WAL mode
+                    db.cursor.execute("PRAGMA busy_timeout = 30000;")
+                    try:
+                        db.cursor.execute("PRAGMA journal_mode = WAL;")
+                    except sqlite3.OperationalError:
+                        pass
 
                 programs = db.get_all_programs()
 
                 # Convert Program objects to dicts for JSON
                 programs_dict = [p.to_dict() for p in programs]
+                programs_dict.extend(
+                    self._load_failed_proposal_nodes(abs_db_path, include_code=False)
+                )
 
                 # Update cache
                 db_cache[db_path] = (time.time(), programs_dict)
@@ -324,9 +550,15 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                 if db.cursor:
                     db.cursor.execute("PRAGMA busy_timeout = 30000;")
-                    db.cursor.execute("PRAGMA journal_mode = WAL;")
+                    try:
+                        db.cursor.execute("PRAGMA journal_mode = WAL;")
+                    except sqlite3.OperationalError:
+                        pass
 
                 summaries = db.get_programs_summary()
+                summaries.extend(
+                    self._load_failed_proposal_nodes(abs_db_path, include_code=False)
+                )
                 self.send_json_response(summaries)
                 print(
                     f"[SERVER] Successfully served {len(summaries)} "
@@ -388,8 +620,27 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                 if db.cursor:
                     db.cursor.execute("PRAGMA busy_timeout = 30000;")
+                    try:
+                        db.cursor.execute("PRAGMA journal_mode = WAL;")
+                    except sqlite3.OperationalError:
+                        pass
 
                 result = db.get_program_count_and_timestamp()
+                failed_nodes = self._load_failed_proposal_nodes(
+                    abs_db_path, include_code=False
+                )
+                if failed_nodes:
+                    result["count"] += len(failed_nodes)
+                    max_failure_timestamp = max(
+                        node["timestamp"]
+                        for node in failed_nodes
+                        if node.get("timestamp") is not None
+                    )
+                    if (
+                        result.get("max_timestamp") is None
+                        or max_failure_timestamp > result["max_timestamp"]
+                    ):
+                        result["max_timestamp"] = max_failure_timestamp
                 self.send_json_response(result)
                 return
 
@@ -437,6 +688,27 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404, f"Database file not found: {actual_db_path}")
             return
 
+        failed_generation = self._parse_failed_node_generation(program_id)
+        if failed_generation is not None:
+            try:
+                failed_nodes = self._load_failed_proposal_nodes(
+                    abs_db_path,
+                    include_code=True,
+                    generation=failed_generation,
+                )
+                if not failed_nodes:
+                    self.send_error(404, f"Program not found: {program_id}")
+                    return
+                self.send_json_response(failed_nodes[0])
+                return
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                self.send_error(500, f"Database error: {str(e)}")
+                return
+            except Exception as e:
+                print(f"[SERVER] Error fetching failed node details: {e}")
+                self.send_error(500, f"Error: {str(e)}")
+                return
+
         max_retries = 8
         delay = 0.2
         for i in range(max_retries):
@@ -447,6 +719,10 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                 if db.cursor:
                     db.cursor.execute("PRAGMA busy_timeout = 30000;")
+                    try:
+                        db.cursor.execute("PRAGMA journal_mode = WAL;")
+                    except sqlite3.OperationalError:
+                        pass
 
                 program = db.get(program_id)
                 if program is None:
@@ -490,7 +766,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                         pass
 
     def handle_get_meta_files(self, db_path: str):
-        """List available meta_{gen}.txt files for a given database."""
+        """List available meta files keyed by processed-count suffix."""
         print(f"[SERVER] Listing meta files for DB: {db_path}")
 
         # Get the actual database path
@@ -505,7 +781,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         if not os.path.exists(meta_dir):
             # Fall back to looking in the db_dir for backward compatibility
-            print(f"[SERVER] Meta subdirectory not found, checking DB directory")
+            print("[SERVER] Meta subdirectory not found, checking DB directory")
             meta_dir = db_dir
 
         if not os.path.exists(meta_dir):
@@ -514,26 +790,28 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         meta_files = []
         try:
-            # Look for meta_{gen}.txt files in the meta directory
+            # Look for meta files named by processed-count suffix
             for file in os.listdir(meta_dir):
                 if file.startswith("meta_") and file.endswith(".txt"):
-                    # Extract generation number
-                    gen_str = file[5:-4]  # Remove 'meta_' and '.txt'
+                    # Extract processed count from meta_<count>.txt
+                    count_str = file[5:-4]  # Remove 'meta_' and '.txt'
                     try:
-                        generation = int(gen_str)
+                        processed_count = int(count_str)
                         meta_files.append(
                             {
-                                "generation": generation,
+                                "processed_count": processed_count,
+                                # Backward-compatible alias for older clients.
+                                "generation": processed_count,
                                 "filename": file,
                                 "path": os.path.join(meta_dir, file),
                             }
                         )
                     except ValueError:
-                        # Skip files that don't have valid generation numbers
+                        # Skip files that don't have valid numeric suffixes
                         continue
 
-            # Sort by generation number
-            meta_files.sort(key=lambda x: x["generation"])
+            # Sort by processed count
+            meta_files.sort(key=lambda x: x["processed_count"])
 
             print(f"[SERVER] Found {len(meta_files)} meta files")
             self.send_json_response(meta_files)
@@ -542,11 +820,11 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
             print(f"[SERVER] Error listing meta files: {e}")
             self.send_error(500, f"Error listing meta files: {str(e)}")
 
-    def handle_get_meta_content(self, db_path: str, generation: str):
-        """Get the content of a specific meta_{gen}.txt file."""
+    def handle_get_meta_content(self, db_path: str, processed_count: str):
+        """Get the content of a specific meta file by processed count."""
         print(
             f"[SERVER] Fetching meta content for DB: {db_path}, "
-            f"generation: {generation}"
+            f"processed_count: {processed_count}"
         )
 
         # Get the actual database path
@@ -557,7 +835,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
         db_dir = os.path.dirname(abs_db_path)
 
         # Construct the meta file path - try meta subdirectory first
-        meta_filename = f"meta_{generation}.txt"
+        meta_filename = f"meta_{processed_count}.txt"
         meta_file_path = os.path.join(db_dir, "meta", meta_filename)
 
         # Fall back to db_dir for backward compatibility
@@ -573,13 +851,16 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 content = f.read()
 
             response_data = {
-                "generation": int(generation),
+                "processed_count": int(processed_count),
+                # Backward-compatible alias for older clients.
+                "generation": int(processed_count),
                 "filename": meta_filename,
                 "content": content,
             }
 
             print(
-                f"[SERVER] Successfully served meta content for generation {generation}"
+                "[SERVER] Successfully served meta content for "
+                f"processed_count {processed_count}"
             )
             self.send_json_response(response_data)
 
@@ -587,10 +868,11 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
             print(f"[SERVER] Error reading meta file: {e}")
             self.send_error(500, f"Error reading meta file: {str(e)}")
 
-    def handle_download_meta_pdf(self, db_path: str, generation: str):
-        """Convert a specific meta_{gen}.txt file to PDF and serve it."""
+    def handle_download_meta_pdf(self, db_path: str, processed_count: str):
+        """Convert a specific meta file to PDF and serve it."""
         print(
-            f"[SERVER] PDF download request for DB: {db_path}, generation: {generation}"
+            "[SERVER] PDF download request for DB: "
+            f"{db_path}, processed_count: {processed_count}"
         )
 
         # Get the actual database path
@@ -601,7 +883,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
         db_dir = os.path.dirname(abs_db_path)
 
         # Construct the meta file path - try meta subdirectory first
-        meta_filename = f"meta_{generation}.txt"
+        meta_filename = f"meta_{processed_count}.txt"
         meta_file_path = os.path.join(db_dir, "meta", meta_filename)
 
         # Fall back to db_dir for backward compatibility
@@ -616,16 +898,16 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
             with open(meta_file_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            pdf_filename = f"meta_{generation}.pdf"
+            pdf_filename = f"meta_{processed_count}.pdf"
 
             # Try to generate PDF using available methods
-            pdf_bytes = self._generate_pdf(content, generation)
+            pdf_bytes = self._generate_pdf(content, processed_count)
 
             if pdf_bytes is None:
                 print("[SERVER] All PDF generation methods failed, serving text")
                 # Fall back to serving formatted text with PDF headers
                 formatted_content = (
-                    f"Meta Generation {generation}\n{'=' * 50}\n\n{content}"
+                    f"Meta Generation {processed_count}\n{'=' * 50}\n\n{content}"
                 )
                 pdf_bytes = formatted_content.encode("utf-8")
 
@@ -862,10 +1144,26 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 cursor.execute("""
                     SELECT
                         COUNT(*) as program_count,
+                        COUNT(DISTINCT generation) as generation_count,
                         SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct_count,
-                        MAX(combined_score) as best_score,
+                        MAX(
+                            CASE WHEN correct = 1
+                            THEN combined_score
+                            ELSE NULL END
+                        ) as best_score,
                         MAX(generation) as max_generation,
+                        MIN(timestamp) as first_update,
                         MAX(timestamp) as last_update,
+                        MIN(
+                            CASE WHEN json_valid(metadata)
+                            THEN json_extract(metadata, '$.pipeline_started_at')
+                            ELSE NULL END
+                        ) as first_pipeline_start,
+                        MAX(
+                            CASE WHEN json_valid(metadata)
+                            THEN json_extract(metadata, '$.postprocess_finished_at')
+                            ELSE NULL END
+                        ) as last_postprocess_finish,
                         SUM(
                             COALESCE(
                                 CASE WHEN json_valid(metadata)
@@ -893,13 +1191,14 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 row = cursor.fetchone()
 
                 # Get the generation where best score was achieved
-                best_gen = row["max_generation"] or 0
+                best_gen = None
                 if row["best_score"] is not None:
                     cursor.execute(
                         """
                         SELECT MIN(generation) as best_gen
                         FROM programs
-                        WHERE combined_score = ?
+                        WHERE correct = 1
+                          AND combined_score = ?
                     """,
                         (row["best_score"],),
                     )
@@ -908,16 +1207,30 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                         best_gen = best_row["best_gen"]
 
                 max_gen = row["max_generation"] or 0
-                gens_since_improvement = max_gen - best_gen
+                gens_since_improvement = (
+                    max_gen - best_gen if best_gen is not None else max_gen
+                )
+                runtime_start = row["first_pipeline_start"]
+                if runtime_start is None:
+                    runtime_start = row["first_update"]
+                runtime_end = row["last_postprocess_finish"]
+                if runtime_end is None:
+                    runtime_end = row["last_update"]
+                total_runtime_seconds = None
+                if runtime_start is not None and runtime_end is not None:
+                    total_runtime_seconds = max(0.0, runtime_end - runtime_start)
 
                 stats = {
                     "program_count": row["program_count"] or 0,
+                    "generation_count": row["generation_count"] or 0,
                     "correct_count": row["correct_count"] or 0,
                     "best_score": row["best_score"],
+                    "best_generation": best_gen,
                     "max_generation": max_gen,
                     "last_update": row["last_update"],
                     "gens_since_improvement": gens_since_improvement,
                     "total_cost": row["total_cost"] or 0,
+                    "total_runtime_seconds": total_runtime_seconds,
                     "prompt_count": 0,
                     "prompt_evo_cost": 0,
                     "has_prompt_evo": False,
@@ -977,6 +1290,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                         "best_score": None,
                         "max_generation": 0,
                         "total_cost": 0,
+                        "total_runtime_seconds": None,
                         "error": str(e),
                     }
                 )
@@ -988,6 +1302,7 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                         "best_score": None,
                         "max_generation": 0,
                         "total_cost": 0,
+                        "total_runtime_seconds": None,
                         "error": str(e),
                     }
                 )

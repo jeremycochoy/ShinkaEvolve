@@ -3,15 +3,13 @@ import os
 import anthropic
 import openai
 import instructor
-from pathlib import Path
-from dotenv import load_dotenv
 from google import genai
+from shinka.env import load_shinka_dotenv
+from shinka.local_openai_config import resolve_local_openai_api_key
+from .constants import TIMEOUT
 from .providers.model_resolver import resolve_model_backend
 
-env_path = Path(__file__).parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path, override=True)
-
-TIMEOUT = 600
+load_shinka_dotenv()
 
 
 def _build_azure_endpoint() -> str:
@@ -21,6 +19,11 @@ def _build_azure_endpoint() -> str:
     if not endpoint.endswith("/"):
         endpoint += "/"
     return endpoint + "openai/v1/"
+
+
+def _google_genai_timeout_ms() -> int:
+    """Convert the shared second-based timeout to google-genai milliseconds."""
+    return int(TIMEOUT * 1000)
 
 
 def get_client_llm(
@@ -42,7 +45,7 @@ def get_client_llm(
     api_model_name = resolved.api_model_name
 
     if provider == "anthropic":
-        client = anthropic.Anthropic(timeout=TIMEOUT)  # 10 minutes
+        client = anthropic.Anthropic(timeout=TIMEOUT)  # 20 minutes
         if structured_output:
             client = instructor.from_anthropic(
                 client, mode=instructor.mode.Mode.ANTHROPIC_JSON
@@ -52,14 +55,14 @@ def get_client_llm(
             aws_access_key=os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
             aws_region=os.getenv("AWS_REGION_NAME"),
-            timeout=TIMEOUT,  # 10 minutes
+            timeout=TIMEOUT,  # 20 minutes
         )
         if structured_output:
             client = instructor.from_anthropic(
                 client, mode=instructor.mode.Mode.ANTHROPIC_JSON
             )
     elif provider == "openai":
-        client = openai.OpenAI(timeout=TIMEOUT)  # 10 minutes
+        client = openai.OpenAI(timeout=TIMEOUT)  # 20 minutes
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.TOOLS_STRICT)
     elif provider == "azure_openai":
@@ -68,7 +71,7 @@ def get_client_llm(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             api_version=os.getenv("AZURE_API_VERSION"),
             azure_endpoint=_build_azure_endpoint(),
-            timeout=TIMEOUT,  # 10 minutes
+            timeout=TIMEOUT,  # 20 minutes
         )
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.TOOLS_STRICT)
@@ -76,12 +79,15 @@ def get_client_llm(
         client = openai.OpenAI(
             api_key=os.environ["DEEPSEEK_API_KEY"],
             base_url="https://api.deepseek.com",
-            timeout=TIMEOUT,  # 10 minutes
+            timeout=TIMEOUT,  # 20 minutes
         )
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.MD_JSON)
     elif provider == "google":
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=genai.types.HttpOptions(timeout=_google_genai_timeout_ms()),
+        )
         if structured_output:
             client = instructor.from_openai(
                 client,
@@ -91,13 +97,13 @@ def get_client_llm(
         client = openai.OpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
             base_url="https://openrouter.ai/api/v1",
-            timeout=TIMEOUT,  # 10 minutes
+            timeout=TIMEOUT,  # 20 minutes
         )
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.MD_JSON)
     elif provider == "local_openai":
         client = openai.OpenAI(
-            api_key=os.getenv("LOCAL_OPENAI_API_KEY", "local"),
+            api_key=resolve_local_openai_api_key(resolved.api_key_env_name),
             base_url=resolved.base_url,
             timeout=TIMEOUT,
         )
@@ -143,7 +149,7 @@ def get_async_client_llm(
                 client, mode=instructor.mode.Mode.ANTHROPIC_JSON
             )
     elif provider == "openai":
-        client = openai.AsyncOpenAI()
+        client = openai.AsyncOpenAI(timeout=TIMEOUT)
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.TOOLS_STRICT)
     elif provider == "azure_openai":
@@ -164,7 +170,10 @@ def get_async_client_llm(
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.MD_JSON)
     elif provider == "google":
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=genai.types.HttpOptions(timeout=_google_genai_timeout_ms()),
+        )
         if structured_output:
             raise ValueError("Gemini does not support structured output.")
     elif provider == "openrouter":
@@ -177,7 +186,7 @@ def get_async_client_llm(
             client = instructor.from_openai(client, mode=instructor.Mode.MD_JSON)
     elif provider == "local_openai":
         client = openai.AsyncOpenAI(
-            api_key=os.getenv("LOCAL_OPENAI_API_KEY", "local"),
+            api_key=resolve_local_openai_api_key(resolved.api_key_env_name),
             base_url=resolved.base_url,
             timeout=TIMEOUT,
         )

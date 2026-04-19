@@ -8,6 +8,8 @@ import rich.box
 import pickle
 from pathlib import Path
 
+from shinka.local_openai_config import parse_local_openai_model
+
 Arm = Union[int, str]
 Subset = Optional[Union[np.ndarray, Sequence[Arm]]]
 
@@ -32,6 +34,37 @@ def _logexpm1(z):
     z = np.asarray(z, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(z > 50.0, z, np.log(np.expm1(z)))
+
+
+def _truncate_middle(text: str, max_width: int) -> str:
+    if len(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return text[:max_width]
+
+    left_width = (max_width - 3) // 2
+    right_width = max_width - 3 - left_width
+    return f"{text[:left_width]}...{text[-right_width:]}"
+
+
+def _format_arm_display_name(name: Arm, max_width: int) -> str:
+    text = str(name)
+    if not isinstance(name, str):
+        return _truncate_middle(text, max_width)
+
+    try:
+        local_match = parse_local_openai_model(name)
+    except ValueError:
+        local_match = None
+
+    if local_match is not None:
+        text = f"local/{local_match.api_model_name}"
+    elif name.startswith("openrouter/"):
+        text = name
+    else:
+        text = name.split("/")[-1]
+
+    return _truncate_middle(text, max_width)
 
 
 class BanditBase(ABC):
@@ -648,13 +681,6 @@ class AsymmetricUCB(BanditBase):
         names = self._arm_names or [str(i) for i in range(self._n_arms)]
         post = self.posterior()
         n = self.n.astype(int)
-        mean = self._mean()
-        if self.use_exponential_scaling:
-            mean_disp = mean  # keep in log space
-            mean_label = "log mean"
-        else:
-            mean_disp = mean
-            mean_label = "mean"
         idx = np.arange(self._n_arms)
 
         # exploitation and exploration components
@@ -740,31 +766,25 @@ class AsymmetricUCB(BanditBase):
             box=rich.box.ROUNDED,
             show_header=True,
             header_style="bold cyan",
-            width=150,
+            width=120,
         )
 
         # Add columns
-        table.add_column("arm", style="white", width=16)
-        table.add_column("n", justify="right", style="green")
-        table.add_column("n_cost", justify="right", style="green")
-        table.add_column("div", justify="right", style="yellow")
-        table.add_column(mean_label, justify="right", style="blue")
-        table.add_column("tot_cost", justify="right", style="yellow")
-        table.add_column("mean_cost", justify="right", style="yellow")
-        table.add_column("exploit", justify="right", style="magenta")
-        table.add_column("explore", justify="right", style="cyan")
-        table.add_column("score_raw", justify="right", style="white")
-        table.add_column("score_cost", justify="right", style="white")
-        table.add_column("score", justify="right", style="bold white")
-        table.add_column("post", justify="right", style="bright_green")
+        table.add_column("arm", style="white", width=24)
+        table.add_column("n", justify="right", style="green", width=4)
+        table.add_column("n_cost", justify="right", style="green", width=7)
+        table.add_column("tot_cost", justify="right", style="yellow", width=8)
+        table.add_column("mean_cost", justify="right", style="yellow", width=8)
+        table.add_column("exploit", justify="right", style="magenta", width=8)
+        table.add_column("explore", justify="right", style="cyan", width=8)
+        table.add_column("score_raw", justify="right", style="white", width=8)
+        table.add_column("score_cost", justify="right", style="white", width=6)
+        table.add_column("score", justify="right", style="bold white", width=8)
+        table.add_column("post", justify="right", style="bright_green", width=6)
 
         # Add rows
         for i, name in enumerate(names):
-            # Split name by "/" and take last part, then last 25 chars
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-25:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=25)
 
             if n_costs[i] > 0:
                 mean_cost_str = f"{mean_costs[i]:.4f}"
@@ -780,8 +800,6 @@ class AsymmetricUCB(BanditBase):
                 display_name,
                 f"{n[i]:d}",
                 f"{n_costs[i]:d}",
-                f"{self.divs[i]:.3f}",
-                f"{mean_disp[i]:.4f}",
                 f"{tot_cost[i]:.4f}",
                 mean_cost_str,
                 f"{exploitation[i]:.4f}",
@@ -940,11 +958,7 @@ class FixedSampler(BanditBase):
 
         # Add rows
         for i, name in enumerate(names):
-            # Split name by "/" and take last part, then last 28 chars
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-28:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=28)
             table.add_row(
                 display_name,
                 f"{n[i]:d}",
@@ -1300,10 +1314,7 @@ class ThompsonSampler(BanditBase):
         table.add_column("post", justify="right", style="bright_green")
 
         for i, name in enumerate(names):
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-25:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=25)
             table.add_row(
                 display_name,
                 f"{n[i]:d}",

@@ -1,7 +1,6 @@
 import json
 import logging
 import time
-import numpy as np
 from typing import Optional, Callable, Any
 import rich.box  # type: ignore
 import rich  # type: ignore
@@ -139,8 +138,13 @@ class DatabaseDisplay:
 
         # Format time
         time_display = "[dim]N/A[/dim]"
-        if program.metadata and "compute_time" in program.metadata:
-            time_val = program.metadata["compute_time"]
+        if program.metadata:
+            time_val = program.metadata.get(
+                "compute_time", program.metadata.get("pipeline_seconds")
+            )
+        else:
+            time_val = None
+        if time_val is not None:
             if time_val > 60:
                 time_display = f"{time_val / 60:.1f}m"
             else:
@@ -163,7 +167,11 @@ class DatabaseDisplay:
         )
         _console.print(table)
 
-    def print_summary(self, console: Optional[RichConsole] = None) -> None:
+    def print_summary(
+        self,
+        console: Optional[RichConsole] = None,
+        total_program_target: Optional[int] = None,
+    ) -> None:
         """Print a summary of the database contents to the terminal."""
         if not self.cursor or not self.conn:
             logger.error("Database not connected. Cannot print summary.")
@@ -197,6 +205,8 @@ class DatabaseDisplay:
                         total_meta_cost += float(metadata["meta_cost"])
                     if "compute_time" in metadata:
                         total_compute_time += float(metadata["compute_time"])
+                    elif "pipeline_seconds" in metadata:
+                        total_compute_time += float(metadata["pipeline_seconds"])
 
                 if row["combined_score"] is not None:
                     score = float(row["combined_score"])
@@ -206,8 +216,6 @@ class DatabaseDisplay:
                         best_score = score
                     num_with_scores += 1
                     all_scores.append(score)
-        median_score = np.median(all_scores)
-
         # Table 1: Summary Table
         summary_table = RichTable(
             title="[bold cyan]Program Database Summary[/bold cyan]",
@@ -228,7 +236,12 @@ class DatabaseDisplay:
 
         # Gather data for summary
         total_programs = self.count_programs_func()
-        summary_table.add_row("Total Programs", f"[bold]{total_programs}[/bold]")
+        total_programs_display = f"[bold]{total_programs}[/bold]"
+        if total_program_target is not None:
+            total_programs_display = (
+                f"[bold]{total_programs}[/bold] / {total_program_target}"
+            )
+        summary_table.add_row("Total Programs", total_programs_display)
 
         # Correctness info
         self.cursor.execute("SELECT COUNT(*) FROM programs WHERE correct = 1")
@@ -616,8 +629,12 @@ class DatabaseDisplay:
 
             # Time
             time_display = "[dim]N/A[/dim]"
-            if prog.metadata and "compute_time" in prog.metadata:
-                time_val = prog.metadata["compute_time"]
+            time_val = None
+            if prog.metadata:
+                time_val = prog.metadata.get(
+                    "compute_time", prog.metadata.get("pipeline_seconds")
+                )
+            if time_val is not None:
                 if time_val > 60:
                     time_display = f"{time_val / 60:.1f}m"
                 else:
