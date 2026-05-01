@@ -5,6 +5,28 @@ Use proposal concurrency to control throughput and emulate prior sync behavior.
 
 ---
 
+## Interactive Throughput Demo
+
+Use the controls below to change the conceptual worker-pool sizes for:
+
+- proposal sampling (`max_proposal_jobs`)
+- evaluation (`max_evaluation_jobs`)
+- database/finalization (`max_db_workers`)
+
+The demo uses proposal jobs directly:
+
+```text
+proposal_capacity = sampling_workers
+```
+
+This is a teaching model, not a replay of exact runtime data. It is meant to
+show how sampling hands candidates off to evaluation while database workers
+finalize completed generations.
+
+<div id="async-throughput-demo"></div>
+
+---
+
 ## Quick Start
 
 ```python
@@ -105,6 +127,7 @@ Oversubscription never increases evaluation concurrency.
 `max_evaluation_jobs` still caps concurrent evals.
 These settings only control how many proposal/sampling jobs Shinka is willing
 to keep in flight ahead of those eval workers.
+
 | Key | What it controls | When to raise it | When to lower it |
 |-----|------------------|------------------|------------------|
 | `enable_controlled_oversubscription` | Master on/off switch. If `false`, proposal target stays at `max_evaluation_jobs`. Default is `false`. | Turn it on if proposals are slower than evals and workers go idle waiting for new candidates. | Leave it off for predictable sync-like behavior or easier debugging. |
