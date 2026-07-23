@@ -165,33 +165,35 @@ def test_query_claude_cli_invokes_command_and_parses_json(tmp_path, monkeypatch)
     assert result.cost == pytest.approx(0.0123)
 
 
-def test_query_claude_cli_forwards_model_and_effort_flags(tmp_path, monkeypatch):
-    payload = {"is_error": False, "result": "x", "total_cost_usd": 0, "usage": {"output_tokens": 1}}
-    fake = _make_fake_claude(tmp_path, payload=payload)
-    monkeypatch.setenv("SHINKA_CLAUDE_CLI_COMMAND", _fake_claude_command(fake))
-    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
-    argv_capture = tmp_path / "argv.txt"
-
-    # Wrap the fake to capture argv to a file (stderr is discarded by the runner).
+def _make_argv_capturing_claude(tmp_path: Path, payload: dict) -> tuple[Path, Path]:
+    """Fake `claude` that dumps its argv to a file and prints ``payload`` as JSON."""
+    argv_capture = tmp_path / "argv.json"
     wrapper = tmp_path / "wrap_claude.py"
     wrapper.write_text(
         "\n".join(
             [
-                "import json, subprocess, sys",
+                "import json, sys",
                 f"argv_path = {str(argv_capture)!r}",
                 "if '--version' in sys.argv:",
-                "    print('fake'); raise SystemExit(0)",
-                f"with open(argv_path, 'w') as f:",
+                "    print('fake claude 1.0'); raise SystemExit(0)",
+                "with open(argv_path, 'w') as f:",
                 "    f.write(json.dumps(sys.argv[1:]))",
                 f"print(json.dumps({payload!r}))",
             ]
         ),
         encoding="utf-8",
     )
+    return wrapper, argv_capture
+
+
+def test_query_claude_cli_forwards_model_effort_and_hardening_flags(tmp_path, monkeypatch):
+    payload = {"is_error": False, "result": "x", "total_cost_usd": 0, "usage": {"output_tokens": 1}}
+    wrapper, argv_capture = _make_argv_capturing_claude(tmp_path, payload)
     monkeypatch.setenv(
         "SHINKA_CLAUDE_CLI_COMMAND",
         f"{shlex.quote(sys.executable)} {shlex.quote(str(wrapper))}",
     )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
 
     query_claude_cli(
         None,
@@ -204,10 +206,44 @@ def test_query_claude_cli_forwards_model_and_effort_flags(tmp_path, monkeypatch)
 
     argv = json.loads(argv_capture.read_text())
     assert "-p" in argv
-    assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
+    assert argv[argv.index("--output-format") + 1] == "json"
     assert argv[argv.index("--model") + 1] == "claude-fable-5"
     assert argv[argv.index("--effort") + 1] == "max"
     assert argv[argv.index("--system-prompt") + 1] == "you are helpful"
+    # Isolation contract: every tool disabled, no ambient settings, permission
+    # checks left ON (nothing to bypass since --tools "" leaves no tools).
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--dangerously-skip-permissions" not in argv
+
+
+def test_query_claude_cli_passes_empty_system_prompt_when_caller_gives_none(
+    tmp_path, monkeypatch
+):
+    """An empty ``system_msg`` must still land as ``--system-prompt ""``
+    so the Claude Code default agent persona is fully replaced (a truthy
+    check would silently fall through to the CLI's built-in system prompt).
+    """
+    payload = {"is_error": False, "result": "x", "total_cost_usd": 0, "usage": {"output_tokens": 1}}
+    wrapper, argv_capture = _make_argv_capturing_claude(tmp_path, payload)
+    monkeypatch.setenv(
+        "SHINKA_CLAUDE_CLI_COMMAND",
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(wrapper))}",
+    )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
+
+    query_claude_cli(
+        None,
+        "claude-cli/claude-opus-4-8",
+        "hello",
+        "",
+        [],
+        output_model=None,
+    )
+
+    argv = json.loads(argv_capture.read_text())
+    assert "--system-prompt" in argv
+    assert argv[argv.index("--system-prompt") + 1] == ""
 
 
 def test_query_claude_cli_rejects_structured_output(tmp_path, monkeypatch):
@@ -249,39 +285,42 @@ def test_query_claude_cli_surfaces_error_payload(tmp_path, monkeypatch):
         )
 
 
-def test_query_claude_cli_serializes_async_calls(tmp_path, monkeypatch):
-    active = 0
-    max_active = 0
+def _install_concurrency_counting_fake(monkeypatch):
+    """Return a ``max_active`` container updated by each fake subprocess."""
+    state = {"active": 0, "max_active": 0}
 
     class FakeProcess:
         returncode = 0
 
         async def communicate(self, _input=None):
-            nonlocal active
             await asyncio.sleep(0.02)
-            active -= 1
-            payload = json.dumps({
-                "is_error": False,
-                "result": "ok",
-                "total_cost_usd": 0.0,
-                "usage": {"output_tokens": 1},
-            }).encode()
+            state["active"] -= 1
+            payload = json.dumps(
+                {
+                    "is_error": False,
+                    "result": "ok",
+                    "total_cost_usd": 0.0,
+                    "usage": {"output_tokens": 1},
+                }
+            ).encode()
             return (payload, b"")
 
         def kill(self):
             raise AssertionError("fake process should not time out")
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        state["active"] += 1
+        state["max_active"] = max(state["max_active"], state["active"])
         return FakeProcess()
 
     monkeypatch.setenv("SHINKA_CLAUDE_CLI_COMMAND", "claude")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    return state
 
-    async def run_two():
-        await asyncio.gather(
+
+async def _fire_n_async_queries(n: int):
+    await asyncio.gather(
+        *[
             query_claude_cli_async(
                 None,
                 "claude-cli/claude-opus-4-8",
@@ -289,19 +328,204 @@ def test_query_claude_cli_serializes_async_calls(tmp_path, monkeypatch):
                 "s",
                 [],
                 output_model=None,
-            ),
+            )
+            for _ in range(n)
+        ]
+    )
+
+
+def test_query_claude_cli_runs_async_calls_in_parallel_by_default(monkeypatch):
+    """No env cap set -> each `claude -p` is an independent session and
+    concurrent invocations proceed in parallel (no process-wide lock)."""
+    monkeypatch.delenv("SHINKA_CLAUDE_CLI_MAX_CONCURRENCY", raising=False)
+    state = _install_concurrency_counting_fake(monkeypatch)
+
+    asyncio.run(_fire_n_async_queries(4))
+
+    assert state["max_active"] > 1, (
+        f"expected parallel execution but only {state['max_active']} subprocess "
+        "ran at once"
+    )
+
+
+def test_query_claude_cli_caps_async_concurrency_when_env_set(monkeypatch):
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_MAX_CONCURRENCY", "1")
+    state = _install_concurrency_counting_fake(monkeypatch)
+
+    asyncio.run(_fire_n_async_queries(4))
+
+    assert state["max_active"] == 1
+
+
+def test_query_claude_cli_semaphore_release_survives_cancellation(monkeypatch):
+    """Regression: an ``async with`` acquire releases on cancellation, so a
+    later capped query must still be able to run."""
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_MAX_CONCURRENCY", "1")
+
+    class NeverProcess:
+        returncode = 0
+
+        async def communicate(self, _input=None):
+            await asyncio.sleep(60)
+            raise AssertionError("should have been cancelled")
+
+        def kill(self):
+            pass
+
+    class QuickProcess:
+        returncode = 0
+
+        async def communicate(self, _input=None):
+            payload = json.dumps(
+                {
+                    "is_error": False,
+                    "result": "ok",
+                    "total_cost_usd": 0.0,
+                    "usage": {"output_tokens": 1},
+                }
+            ).encode()
+            return (payload, b"")
+
+        def kill(self):
+            pass
+
+    calls = {"n": 0}
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        calls["n"] += 1
+        return NeverProcess() if calls["n"] == 1 else QuickProcess()
+
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_COMMAND", "claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        first = asyncio.create_task(
             query_claude_cli_async(
-                None,
-                "claude-cli/claude-opus-4-8",
-                "u",
-                "s",
-                [],
-                output_model=None,
+                None, "claude-cli/claude-opus-4-8", "u", "s", [], output_model=None
+            )
+        )
+        # Let `first` acquire the semaphore and start awaiting communicate().
+        await asyncio.sleep(0.05)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The semaphore must have been released; the second call must proceed.
+        result = await asyncio.wait_for(
+            query_claude_cli_async(
+                None, "claude-cli/claude-opus-4-8", "u", "s", [], output_model=None
             ),
+            timeout=2.0,
+        )
+        assert result.content == "ok"
+
+    asyncio.run(scenario())
+
+
+def test_query_claude_cli_retries_transient_then_succeeds(tmp_path, monkeypatch):
+    """First invocation fails with an ``Overloaded`` message, second succeeds.
+    The wrapper's transient-retry loop must swallow the first and return the
+    second result rather than raising."""
+    state_file = tmp_path / "attempts.txt"
+    state_file.write_text("0", encoding="utf-8")
+    payload = {"is_error": False, "result": "ok", "total_cost_usd": 0, "usage": {"output_tokens": 1}}
+    script = tmp_path / "flaky_claude.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import json, sys",
+                f"state = {str(state_file)!r}",
+                "if '--version' in sys.argv:",
+                "    print('fake'); raise SystemExit(0)",
+                "with open(state) as f: n = int(f.read())",
+                "with open(state, 'w') as f: f.write(str(n + 1))",
+                "if n == 0:",
+                "    sys.stderr.write('Overloaded\\n'); raise SystemExit(1)",
+                f"print(json.dumps({payload!r}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "SHINKA_CLAUDE_CLI_COMMAND",
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+    )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
+    # Speed the retry backoff so the test doesn't sleep several seconds.
+    import shinka.llm.providers.claude_cli as claude_cli_mod
+    monkeypatch.setattr(claude_cli_mod, "_TRANSIENT_BACKOFF_SECONDS", 0.0)
+
+    result = query_claude_cli(
+        None,
+        "claude-cli/claude-opus-4-8",
+        "u",
+        "s",
+        [],
+        output_model=None,
+    )
+
+    assert result.content == "ok"
+    assert state_file.read_text() == "2"
+
+
+def test_query_claude_cli_rejects_empty_stdout(tmp_path, monkeypatch):
+    script = tmp_path / "silent_claude.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "if '--version' in sys.argv:",
+                "    print('fake'); raise SystemExit(0)",
+                "raise SystemExit(0)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "SHINKA_CLAUDE_CLI_COMMAND",
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+    )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
+
+    with pytest.raises(ValueError, match="stdout was empty"):
+        query_claude_cli(
+            None,
+            "claude-cli/claude-opus-4-8",
+            "u",
+            "s",
+            [],
+            output_model=None,
         )
 
-    asyncio.run(run_two())
-    assert max_active == 1
+
+def test_query_claude_cli_raises_on_non_zero_exit(tmp_path, monkeypatch):
+    script = tmp_path / "failing_claude.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "if '--version' in sys.argv:",
+                "    print('fake'); raise SystemExit(0)",
+                "sys.stderr.write('boom: internal error\\n')",
+                "raise SystemExit(2)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "SHINKA_CLAUDE_CLI_COMMAND",
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+    )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
+
+    with pytest.raises(RuntimeError, match="boom: internal error"):
+        query_claude_cli(
+            None,
+            "claude-cli/claude-opus-4-8",
+            "u",
+            "s",
+            [],
+            output_model=None,
+        )
 
 
 def test_validate_model_env_access_runs_claude_cli_check(tmp_path, monkeypatch):

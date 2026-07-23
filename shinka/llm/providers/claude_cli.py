@@ -13,9 +13,26 @@ Effort levels accepted mirror the CLI: ``low``, ``medium``, ``high``, ``xhigh``,
 ``max``. When ``effort`` is omitted, the CLI's default is used.
 
 The wrapper shells out to ``claude -p`` with ``--output-format json`` and reads
-the resulting JSON payload for content and token usage. Concurrent async calls
-are serialised through a process-wide lock (Claude Code holds session-scoped
-state so parallel invocations from the same account are not safe).
+the resulting JSON payload for content and token usage.
+
+Isolation contract — each subprocess is a pure text completion:
+    - ``--tools ""`` disables every built-in tool, so the model cannot run
+      Bash, edit files, or otherwise touch disk / network.
+    - ``--setting-sources ""`` skips user/project/local settings so ambient
+      ``CLAUDE.md`` and ``.claude/settings.json`` (including hooks) in the
+      caller's CWD cannot influence or execute around each query.
+    - ``--system-prompt`` is passed unconditionally, so the caller's system
+      message always fully replaces the default Claude Code agent persona
+      (an empty string is a valid replacement).
+    - ``--dangerously-skip-permissions`` is intentionally NOT set — with zero
+      tools there is nothing to bypass, and skipping permissions here would
+      re-open the sandbox against prompt-injection from evolved programs.
+
+Concurrency — every ``claude -p`` invocation is an independent CLI session, so
+parallel calls are safe by default. The async path exposes an optional cap via
+``SHINKA_CLAUDE_CLI_MAX_CONCURRENCY`` (unset ⇒ unbounded; useful for throttling
+against Claude Code subscription rate limits). The cap is enforced with an
+``asyncio.Semaphore`` whose ``async with`` acquire is cancellation-safe.
 
 Authentication uses whatever ``claude`` itself resolves at runtime (typically
 the persisted OAuth login for a Claude Code subscription). Any inherited
@@ -29,7 +46,6 @@ import json
 import os
 import shlex
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -45,11 +61,12 @@ CLAUDE_CLI_PREFIX = "claude-cli/"
 DEFAULT_CLAUDE_CLI_COMMAND = "claude"
 CLAUDE_CLI_COMMAND_ENV = "SHINKA_CLAUDE_CLI_COMMAND"
 CLAUDE_CLI_TIMEOUT_ENV = "SHINKA_CLAUDE_CLI_TIMEOUT"
+CLAUDE_CLI_MAX_CONCURRENCY_ENV = "SHINKA_CLAUDE_CLI_MAX_CONCURRENCY"
 
 _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-_THREAD_LOCK = threading.Lock()
 _TRANSIENT_RETRIES = 2
 _TRANSIENT_BACKOFF_SECONDS = 3.0
+_SEMAPHORES: "dict[asyncio.AbstractEventLoop, asyncio.Semaphore]" = {}
 
 
 @dataclass(frozen=True)
@@ -73,6 +90,28 @@ def claude_cli_timeout() -> float:
     if value <= 0:
         raise ValueError(f"{CLAUDE_CLI_TIMEOUT_ENV} must be > 0.")
     return value
+
+
+def claude_cli_max_concurrency() -> int | None:
+    raw = os.getenv(CLAUDE_CLI_MAX_CONCURRENCY_ENV)
+    if raw is None or not raw.strip():
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{CLAUDE_CLI_MAX_CONCURRENCY_ENV} must be > 0.")
+    return value
+
+
+def _semaphore_for_current_loop() -> asyncio.Semaphore | None:
+    cap = claude_cli_max_concurrency()
+    if cap is None:
+        return None
+    loop = asyncio.get_running_loop()
+    sem = _SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(cap)
+        _SEMAPHORES[loop] = sem
+    return sem
 
 
 def parse_claude_cli_model(model_name: str) -> ClaudeCliModel:
@@ -146,10 +185,13 @@ def _build_command(model: ClaudeCliModel, system_msg: str) -> list[str]:
         "-p",
         "--output-format",
         "json",
-        "--dangerously-skip-permissions",
+        "--tools",
+        "",
+        "--setting-sources",
+        "",
+        "--system-prompt",
+        system_msg,
     ]
-    if system_msg:
-        cmd.extend(["--system-prompt", system_msg])
     if model.model:
         cmd.extend(["--model", model.model])
     if model.effort:
@@ -327,8 +369,7 @@ def query_claude_cli(
     command = _build_command(parsed, system_msg)
 
     try:
-        with _THREAD_LOCK:
-            completed = _run_sync(command, prompt)
+        completed = _run_sync(command, prompt)
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
             f"claude CLI query timed out after {claude_cli_timeout()}s."
@@ -351,10 +392,6 @@ def query_claude_cli(
     )
 
 
-async def _acquire_cli_lock_async() -> None:
-    await asyncio.to_thread(_THREAD_LOCK.acquire)
-
-
 async def query_claude_cli_async(
     client,
     model,
@@ -372,16 +409,21 @@ async def query_claude_cli_async(
     prompt = _render_prompt(msg, msg_history)
     command = _build_command(parsed, system_msg)
 
-    await _acquire_cli_lock_async()
-    try:
+    semaphore = _semaphore_for_current_loop()
+
+    async def _run_under_cap():
         try:
-            completed = await _run_async(command, prompt)
+            return await _run_async(command, prompt)
         except asyncio.TimeoutError as exc:
             raise TimeoutError(
                 f"claude CLI query timed out after {claude_cli_timeout()}s."
             ) from exc
-    finally:
-        _THREAD_LOCK.release()
+
+    if semaphore is None:
+        completed = await _run_under_cap()
+    else:
+        async with semaphore:
+            completed = await _run_under_cap()
 
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
