@@ -93,7 +93,7 @@ def get_client_llm(
             timeout=TIMEOUT,
             max_retries=OPENAI_MAX_RETRIES,
         )
-    elif provider == "headless":
+    elif provider in ("headless", "claude_cli"):
         client = None
     else:
         raise ValueError(f"Model {model_name} not supported.")
@@ -178,7 +178,7 @@ def get_async_client_llm(
             timeout=TIMEOUT,
             max_retries=OPENAI_MAX_RETRIES,
         )
-    elif provider == "headless":
+    elif provider in ("headless", "claude_cli"):
         client = None
     else:
         raise ValueError(f"Model {model_name} not supported.")
