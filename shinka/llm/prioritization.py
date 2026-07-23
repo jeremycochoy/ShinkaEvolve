@@ -220,6 +220,77 @@ class BanditBase(ABC):
             state = pickle.load(f)
         self.set_state(state)
 
+    def _state_arm_names(self) -> Optional[List[str]]:
+        if self._arm_names is None:
+            return None
+        return list(self._arm_names)
+
+    def _align_state_array(
+        self,
+        state: Dict[str, Any],
+        key: str,
+        default: np.ndarray,
+    ) -> np.ndarray:
+        if key not in state:
+            return default.copy()
+
+        saved = np.asarray(state[key], dtype=default.dtype)
+        if saved.ndim != 1:
+            raise ValueError(f"bandit state field '{key}' must be one-dimensional")
+
+        aligned = default.copy()
+        saved_arm_names = state.get("arm_names")
+        if saved_arm_names is not None and self._arm_names is not None:
+            saved_name_to_idx = {
+                name: i for i, name in enumerate(saved_arm_names) if i < saved.size
+            }
+            for i, name in enumerate(self._arm_names):
+                saved_i = saved_name_to_idx.get(name)
+                if saved_i is not None:
+                    aligned[i] = saved[saved_i]
+            return aligned
+
+        n = min(saved.size, aligned.size)
+        if n > 0:
+            aligned[:n] = saved[:n]
+        return aligned
+
+    def _state_arm_layout_matches(self, state: Dict[str, Any], key: str) -> bool:
+        saved_arm_names = state.get("arm_names")
+        if saved_arm_names is not None and self._arm_names is not None:
+            return list(saved_arm_names) == self._arm_names
+        if key not in state:
+            return True
+        return np.asarray(state[key]).size == self.n_arms
+
+    def _restore_observation_range(self, state: Dict[str, Any]) -> None:
+        if self._state_arm_layout_matches(state, "s"):
+            self._obs_max = state["obs_max"]
+            self._obs_min = state["obs_min"]
+            return
+
+        seen = self.divs > 0.0
+        means = self._mean()[seen]
+        finite_means = means[np.isfinite(means)]
+
+        if self.asymmetric_scaling:
+            if self.use_exponential_scaling:
+                self._obs_min = -np.inf
+                self._obs_max = (
+                    float(finite_means.max()) if finite_means.size > 0 else -np.inf
+                )
+            else:
+                self._obs_min = 0.0
+                self._obs_max = (
+                    max(0.0, float(finite_means.max()))
+                    if finite_means.size > 0
+                    else 0.0
+                )
+            return
+
+        self._obs_max = float(finite_means.max()) if finite_means.size > 0 else -np.inf
+        self._obs_min = float(finite_means.min()) if finite_means.size > 0 else np.inf
+
 
 class AsymmetricUCB(BanditBase):
     # asymmetric ucb1 with ε-exploration and adaptive scaling
@@ -500,6 +571,32 @@ class AsymmetricUCB(BanditBase):
         cost_ref = max(cost_ref, denom_floor)
 
         return cost_ref / cost_denom
+
+    def _restore_cost_range(self, state: Dict[str, Any]) -> None:
+        if (
+            self._state_arm_layout_matches(state, "n_costs")
+            and "min_cost_observed" in state
+            and "max_cost_observed" in state
+        ):
+            self.min_cost_observed = float(state["min_cost_observed"])
+            self.max_cost_observed = float(state["max_cost_observed"])
+            return
+
+        have_cost = self.n_costs > 0.0
+        if not np.any(have_cost):
+            self.min_cost_observed = np.inf
+            self.max_cost_observed = -np.inf
+            return
+
+        mean_costs = self.total_costs[have_cost] / self.n_costs[have_cost]
+        finite_costs = mean_costs[np.isfinite(mean_costs)]
+        if finite_costs.size == 0:
+            self.min_cost_observed = np.inf
+            self.max_cost_observed = -np.inf
+            return
+
+        self.min_cost_observed = float(finite_costs.min())
+        self.max_cost_observed = float(finite_costs.max())
 
     def posterior(self, subset=None, samples=None):
         idx = self._resolve_subset(subset)
@@ -817,6 +914,7 @@ class AsymmetricUCB(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "n_submitted": self.n_submitted.copy(),
             "n_completed": self.n_completed.copy(),
             "s": self.s.copy(),
@@ -826,19 +924,27 @@ class AsymmetricUCB(BanditBase):
             "obs_min": self._obs_min,
             "n_costs": self.n_costs.copy(),
             "total_costs": self.total_costs.copy(),
+            "min_cost_observed": self.min_cost_observed,
+            "max_cost_observed": self.max_cost_observed,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
-        self.n_submitted = state["n_submitted"].copy()
-        self.n_completed = state["n_completed"].copy()
-        self.s = state["s"].copy()
-        self.divs = state["divs"].copy()
+        self.n_submitted = self._align_state_array(
+            state, "n_submitted", self.n_submitted
+        )
+        self.n_completed = self._align_state_array(
+            state, "n_completed", self.n_completed
+        )
+        self.s = self._align_state_array(state, "s", self.s)
+        self.divs = self._align_state_array(state, "divs", self.divs)
         self._baseline = state["baseline"]
-        self._obs_max = state["obs_max"]
-        self._obs_min = state["obs_min"]
-        self.n_costs = state["n_costs"].copy()
-        self.total_costs = state["total_costs"].copy()
+        self._restore_observation_range(state)
+        self.n_costs = self._align_state_array(state, "n_costs", self.n_costs)
+        self.total_costs = self._align_state_array(
+            state, "total_costs", self.total_costs
+        )
+        self._restore_cost_range(state)
 
 
 class FixedSampler(BanditBase):
@@ -974,6 +1080,7 @@ class FixedSampler(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "baseline": self._baseline,
             "p": self.p.copy(),
             "n_pulls": self.n_pulls.copy(),
@@ -984,13 +1091,16 @@ class FixedSampler(BanditBase):
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
         self._baseline = state["baseline"]
-        self.p = state["p"].copy()
-        if "n_pulls" in state:
-            self.n_pulls = state["n_pulls"].copy()
-        if "n_costs" in state:
-            self.n_costs = state["n_costs"].copy()
-        if "total_costs" in state:
-            self.total_costs = state["total_costs"].copy()
+        self.p = self._align_state_array(state, "p", self.p)
+        p_sum = float(self.p.sum())
+        if p_sum <= 0.0:
+            raise ValueError("loaded fixed sampler probabilities must sum to > 0")
+        self.p = self.p / p_sum
+        self.n_pulls = self._align_state_array(state, "n_pulls", self.n_pulls)
+        self.n_costs = self._align_state_array(state, "n_costs", self.n_costs)
+        self.total_costs = self._align_state_array(
+            state, "total_costs", self.total_costs
+        )
 
 
 class ThompsonSampler(BanditBase):
@@ -1332,6 +1442,7 @@ class ThompsonSampler(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "n_submitted": self.n_submitted.copy(),
             "n_completed": self.n_completed.copy(),
             "s": self.s.copy(),
@@ -1345,12 +1456,15 @@ class ThompsonSampler(BanditBase):
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
-        self.n_submitted = state["n_submitted"].copy()
-        self.n_completed = state["n_completed"].copy()
-        self.s = state["s"].copy()
-        self.divs = state["divs"].copy()
-        self.alpha = state["alpha"].copy()
-        self.beta = state["beta"].copy()
+        self.n_submitted = self._align_state_array(
+            state, "n_submitted", self.n_submitted
+        )
+        self.n_completed = self._align_state_array(
+            state, "n_completed", self.n_completed
+        )
+        self.s = self._align_state_array(state, "s", self.s)
+        self.divs = self._align_state_array(state, "divs", self.divs)
+        self.alpha = self._align_state_array(state, "alpha", self.alpha)
+        self.beta = self._align_state_array(state, "beta", self.beta)
         self._baseline = state["baseline"]
-        self._obs_max = state["obs_max"]
-        self._obs_min = state["obs_min"]
+        self._restore_observation_range(state)

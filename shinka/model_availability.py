@@ -14,6 +14,7 @@ from shinka.embed.providers.pricing import (
 from shinka.google_genai import google_genai_auth_mode
 from shinka.llm.providers.model_resolver import resolve_model_backend
 from shinka.llm.providers.pricing import get_all_providers, get_models_by_provider
+from shinka.llm.providers.headless import check_headless_available
 
 
 PROVIDER_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
@@ -30,6 +31,7 @@ PROVIDER_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "GOOGLE_CLOUD_LOCATION",
     ),
 }
+AZURE_LLM_ENV_REQUIREMENTS = ("AZURE_OPENAI_API_KEY", "AZURE_API_ENDPOINT")
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,10 @@ def missing_env_vars_for_provider(provider: str) -> tuple[str, ...]:
     env_var_names = provider_env_requirements(provider)
     if env_var_names is None:
         return ()
+    return _missing_env_vars(env_var_names)
+
+
+def _missing_env_vars(env_var_names: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(
         env_var_name
         for env_var_name, is_present in env_var_status(env_var_names).items()
@@ -65,26 +71,43 @@ def missing_env_vars_for_provider(provider: str) -> tuple[str, ...]:
     )
 
 
+def model_env_requirements(provider: str, model_kind: str) -> tuple[str, ...] | None:
+    normalized_provider = "azure" if provider == "azure_openai" else provider
+    if normalized_provider == "azure" and model_kind == "llm":
+        return AZURE_LLM_ENV_REQUIREMENTS
+    return provider_env_requirements(provider)
+
+
 def build_provider_availability_entry(provider: str) -> dict[str, Any] | None:
-    env_var_names = provider_env_requirements(provider)
-    if env_var_names is None:
+    llm_env_var_names = model_env_requirements(provider, "llm")
+    embedding_env_var_names = model_env_requirements(provider, "embedding")
+    if llm_env_var_names is None and embedding_env_var_names is None:
         return None
 
-    env_vars = env_var_status(env_var_names)
-    if not all(env_vars.values()):
-        return None
-
-    llm_models = sorted(get_models_by_provider(provider))
-    embedding_models = sorted(get_embedding_models_by_provider(provider))
+    llm_models = _available_models(get_models_by_provider(provider), llm_env_var_names)
+    embedding_models = _available_models(
+        get_embedding_models_by_provider(provider), embedding_env_var_names
+    )
     if not llm_models and not embedding_models:
         return None
 
+    env_var_names = tuple(
+        sorted(set(llm_env_var_names or ()) | set(embedding_env_var_names or ()))
+    )
     return {
         "provider": provider,
-        "env_vars": env_vars,
+        "env_vars": env_var_status(env_var_names),
         "llm_models": llm_models,
         "embedding_models": embedding_models,
     }
+
+
+def _available_models(
+    models: Iterable[str], env_var_names: tuple[str, ...] | None
+) -> list[str]:
+    if env_var_names is None or _missing_env_vars(env_var_names):
+        return []
+    return sorted(models)
 
 
 def build_model_availability_payload() -> dict[str, Any]:
@@ -150,6 +173,22 @@ def validate_model_env_access(
     llm_models: Iterable[str] = (),
     embedding_models: Iterable[str] = (),
 ) -> None:
+    llm_models = list(llm_models)
+    embedding_models = list(embedding_models)
+    headless_models = [
+        model_name
+        for model_name in llm_models
+        if resolve_model_backend(model_name).provider == "headless"
+    ]
+    if headless_models:
+        try:
+            check_headless_available()
+        except ValueError as exc:
+            models = ", ".join(headless_models)
+            raise ValueError(
+                f"Requested headless model(s) are unavailable: {models}. {exc}"
+            ) from exc
+
     issues = find_model_env_access_issues(
         llm_models=llm_models,
         embedding_models=embedding_models,
@@ -179,7 +218,10 @@ def _model_env_access_issues(
     provider: str,
     api_key_env_name: str | None,
 ) -> list[ModelEnvAccessIssue]:
-    missing_env_vars = missing_env_vars_for_provider(provider)
+    env_var_names = model_env_requirements(provider, model_kind)
+    missing_env_vars: tuple[str, ...] = ()
+    if env_var_names is not None:
+        missing_env_vars = _missing_env_vars(env_var_names)
 
     if provider == "local_openai" and api_key_env_name:
         missing_env_vars = (

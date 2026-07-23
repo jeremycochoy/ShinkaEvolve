@@ -62,7 +62,18 @@ from shinka.core.prompt_evolver import (
 from shinka.core.runtime_slots import LogicalSlotPool
 from shinka.logo import BannerStyle, get_logo_ascii, print_gradient_logo
 from shinka.model_availability import validate_model_env_access
-from shinka.utils import get_language_extension, parse_time_to_seconds
+from shinka.pricing.catalog import (
+    activate_model_catalog,
+    load_run_pricing_snapshot,
+    refresh_model_catalog,
+    write_run_pricing_snapshot,
+)
+from shinka.wandb_logging import ShinkaWandbLogger
+from shinka.utils import (
+    get_language_extension,
+    parse_time_to_seconds,
+    truncate_log_tail,
+)
 from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
@@ -187,6 +198,13 @@ def _dedupe_model_names(model_names: Iterable[str]) -> list[str]:
     return deduped
 
 
+def _llm_kwargs_with_headless_work_dir(
+    llm_kwargs: Dict[str, Any],
+    results_dir: Path,
+) -> Dict[str, Any]:
+    return {"headless_work_dir": str(results_dir), **llm_kwargs}
+
+
 def _validate_evo_config_model_env_access(evo_config: EvolutionConfig) -> None:
     llm_models = list(evo_config.llm_models)
 
@@ -244,6 +262,12 @@ class ShinkaEvolveRunner:
             evaluate_str: Optional string content for evaluate script
                 (will be saved to results dir and path updated in job_config)
         """
+        pricing_snapshot = (
+            load_run_pricing_snapshot(Path(evo_config.results_dir))
+            if evo_config.results_dir is not None
+            else None
+        )
+        pricing_snapshot = pricing_snapshot or refresh_model_catalog()
         _validate_evo_config_model_env_access(evo_config)
 
         self.verbose = verbose
@@ -257,6 +281,7 @@ class ShinkaEvolveRunner:
         self.evo_config = evo_config
         self.job_config = job_config
         self.db_config = db_config
+        self.wandb_logger = ShinkaWandbLogger(enabled=evo_config.enable_wandb_logging)
         self.banner_style = banner_style
         self.enable_deadlock_debugging = debug
         log_filename = f"{self.results_dir}/evolution_run.log"
@@ -285,6 +310,16 @@ class ShinkaEvolveRunner:
         else:
             # Ensure results directory exists even when not verbose
             Path(self.results_dir).mkdir(parents=True, exist_ok=True)
+
+        self.pricing_snapshot = pricing_snapshot
+        write_run_pricing_snapshot(pricing_snapshot, Path(self.results_dir))
+        logger.info(
+            "Pricing catalog: source=%s fetched_at=%s stale=%s sha256=%s",
+            pricing_snapshot.source,
+            pricing_snapshot.fetched_at,
+            pricing_snapshot.stale,
+            pricing_snapshot.sha256,
+        )
 
         _print_gradient_logo_and_mirror(
             Path(log_filename), banner_style=self.banner_style
@@ -383,7 +418,10 @@ class ShinkaEvolveRunner:
         # LLM clients
         self.llm = AsyncLLMClient(
             model_names=evo_config.llm_models,
-            **evo_config.llm_kwargs,
+            **_llm_kwargs_with_headless_work_dir(
+                evo_config.llm_kwargs,
+                Path(self.results_dir),
+            ),
         )
 
         # Embedding client (use async version for async runner)
@@ -425,7 +463,10 @@ class ShinkaEvolveRunner:
             # Create async LLM client for meta analysis
             async_meta_llm = AsyncLLMClient(
                 model_names=evo_config.meta_llm_models or evo_config.llm_models,
-                **evo_config.meta_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.meta_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             # Create sync summarizer for state management
             sync_meta_summarizer = MetaSummarizer(
@@ -447,7 +488,10 @@ class ShinkaEvolveRunner:
         if evo_config.novelty_llm_models:
             novelty_llm = AsyncLLMClient(
                 model_names=evo_config.novelty_llm_models,
-                **evo_config.novelty_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.novelty_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             sync_novelty_judge = NoveltyJudge(
                 novelty_llm_client=None,  # We'll use async version
@@ -479,7 +523,10 @@ class ShinkaEvolveRunner:
             prompt_llm_models = evo_config.prompt_llm_models or evo_config.llm_models
             self.prompt_llm = AsyncLLMClient(
                 model_names=prompt_llm_models,
-                **evo_config.prompt_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.prompt_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             logger.info(f"Prompt evolution enabled with models: {prompt_llm_models}")
         else:
@@ -960,6 +1007,7 @@ class ShinkaEvolveRunner:
 
     async def run_async(self):
         """Main async evolution loop."""
+        activate_model_catalog(self.pricing_snapshot)
         self.start_time = time.time()
         self.last_progress_time = self.start_time  # Initialize progress tracking
         tasks = []  # Initialize tasks list to avoid UnboundLocalError
@@ -1145,6 +1193,13 @@ class ShinkaEvolveRunner:
         # Initialize prompt evolution database if enabled
         if self.evo_config.evolve_prompts:
             await self._setup_prompt_evolution()
+
+        self.wandb_logger.start(
+            evo_config=self.evo_config,
+            db_config=self.db_config,
+            job_config=self.job_config,
+            results_dir=Path(self.results_dir),
+        )
 
         # Check if we're resuming from an existing database
         resuming_run = db_path.exists() and self.db.last_iteration > 0
@@ -1556,7 +1611,10 @@ class ShinkaEvolveRunner:
             public_metrics = metrics_val.get("public", {})
             private_metrics = metrics_val.get("private", {})
             text_feedback = metrics_val.get("text_feedback", "")
-            stdout_log = results.get("stdout_log", "")
+            stdout_log = truncate_log_tail(
+                results.get("stdout_log", ""),
+                self.db_config.max_stdout_log_chars,
+            )
             stderr_log = results.get("stderr_log", "")
 
             # Build base metadata
@@ -1758,6 +1816,7 @@ class ShinkaEvolveRunner:
             postprocess_finished_at=postprocess_finished_at,
         )
         await self._persist_program_metadata_async(initial_program)
+        self._log_program_to_wandb(initial_program)
 
         if self.verbose:
             logger.info(f"Setup initial program: {initial_program.id}")
@@ -3003,6 +3062,17 @@ class ShinkaEvolveRunner:
             response_file = attempt_dir / "llm_response.txt"
             await write_file_async(str(response_file), response.content)
 
+        response_kwargs = getattr(response, "kwargs", {}) if response else {}
+        headless_prompt_path = response_kwargs.get("headless_prompt_path")
+        if headless_prompt_path:
+            prompt_source = Path(headless_prompt_path)
+            if prompt_source.exists():
+                prompt_file = attempt_dir / "headless_prompt.md"
+                await write_file_async(
+                    str(prompt_file),
+                    prompt_source.read_text(encoding="utf-8"),
+                )
+
         # Save patch text if available
         if patch_text:
             patch_file = attempt_dir / "patch.txt"
@@ -3024,7 +3094,11 @@ class ShinkaEvolveRunner:
 
         if response:
             metadata["llm_cost"] = response.cost
-            metadata["llm_model"] = getattr(response, "model", None)
+            metadata["llm_model"] = getattr(response, "model_name", None)
+            if headless_prompt_path:
+                metadata["headless_prompt_path"] = str(
+                    attempt_dir / "headless_prompt.md"
+                )
 
         metadata_file = attempt_dir / "metadata.json"
         await write_file_async(str(metadata_file), json.dumps(metadata, indent=2))
@@ -3125,6 +3199,12 @@ class ShinkaEvolveRunner:
             "cc": "cpp",
             "cxx": "cpp",
             "cu": "cuda",
+            "go": "go",
+            "sv": "verilog",
+            "f90": "fortran",
+            "f95": "fortran",
+            "f03": "fortran",
+            "f08": "fortran",
         }.get(ext, ext or "python")
 
     async def _write_failure_artifact_async(
@@ -3954,6 +4034,7 @@ class ShinkaEvolveRunner:
             await self._update_completed_generations()
             self._record_progress()
             self.slot_available.set()
+            self._log_program_to_wandb(program)
             logger.info(
                 "Persisted failed generation %s as incorrect program %s (%s)",
                 generation,
@@ -4025,7 +4106,10 @@ class ShinkaEvolveRunner:
                 public_metrics = metrics_val.get("public", {})
                 private_metrics = metrics_val.get("private", {})
                 text_feedback = metrics_val.get("text_feedback", "")
-                stdout_log = results.get("stdout_log", "")
+                stdout_log = truncate_log_tail(
+                    results.get("stdout_log", ""),
+                    self.db_config.max_stdout_log_chars,
+                )
                 stderr_log = results.get("stderr_log", "")
 
                 logger.info(
@@ -4469,6 +4553,7 @@ class ShinkaEvolveRunner:
                         f"Apply-stage metadata persistence error for {job.job_id}: {e}"
                     )
 
+        self._log_program_to_wandb(program)
         logger.info(
             "✅ JOB COMPLETE: Finished processing %s - program %s added (gen %s)",
             job.job_id,
@@ -5450,6 +5535,7 @@ class ShinkaEvolveRunner:
                     logger.warning(f"Failed to recompute prompt percentiles: {e}")
 
             # Cleanup database
+            self._finish_wandb_logging()
             await self.async_db.close_async()
 
             # Cleanup scheduler
@@ -5457,6 +5543,22 @@ class ShinkaEvolveRunner:
 
         except Exception as e:
             logger.error(f"Error in async cleanup: {e}")
+
+    def _log_program_to_wandb(self, program: Program) -> None:
+        wandb_logger = getattr(self, "wandb_logger", None)
+        if wandb_logger is not None:
+            wandb_logger.log_program(program)
+
+    def _finish_wandb_logging(self) -> None:
+        wandb_logger = getattr(self, "wandb_logger", None)
+        if wandb_logger is None:
+            return
+        wandb_logger.log_final(
+            db=getattr(self, "db", None),
+            total_proposals_generated=getattr(self, "total_proposals_generated", None),
+            total_api_cost=getattr(self, "total_api_cost", None),
+        )
+        wandb_logger.finish()
 
     async def _print_final_summary(self):
         """Print final evolution summary."""

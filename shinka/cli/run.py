@@ -17,6 +17,8 @@ from shinka.cli.run_config import load_optional_yaml_config
 SUPPORTED_INITIAL_EXTENSIONS: dict[str, str] = {
     ".py": "python",
     ".jl": "julia",
+    ".go": "go",
+    ".sv": "verilog",
     ".rs": "rust",
     ".swift": "swift",
     ".cpp": "cpp",
@@ -24,10 +26,16 @@ SUPPORTED_INITIAL_EXTENSIONS: dict[str, str] = {
     ".cxx": "cpp",
     ".cu": "cuda",
     ".json": "json",
+    ".f90": "fortran",
+    ".f95": "fortran",
+    ".f03": "fortran",
+    ".f08": "fortran",
 }
 
 INITIAL_EXTENSION_PRIORITY: list[str] = [
     ".py",
+    ".go",
+    ".sv",
     ".jl",
     ".rs",
     ".cpp",
@@ -36,6 +44,10 @@ INITIAL_EXTENSION_PRIORITY: list[str] = [
     ".cu",
     ".swift",
     ".json",
+    ".f90",
+    ".f95",
+    ".f03",
+    ".f08",
 ]
 
 

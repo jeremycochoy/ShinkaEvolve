@@ -78,6 +78,22 @@ LOCAL_OPENAI_API_KEY=local                             # Optional
 CUSTOM_API_KEY=...                                     # Optional
 ```
 
+For Azure OpenAI v1 LLM deployments, use the resource root as the endpoint and
+prefix the deployment name with `azure-` in `llm_models`:
+
+```bash
+AZURE_OPENAI_API_KEY=your-azure-key
+AZURE_API_ENDPOINT=https://your-resource.openai.azure.com
+```
+
+```python
+evo_config = EvolutionConfig(llm_models=["azure-gpt-5-mini"])
+```
+
+Azure v1 LLM calls do not require `AZURE_API_VERSION`. Azure embedding models
+still use the versioned Azure API client and additionally require, for example,
+`AZURE_API_VERSION=2024-02-01`.
+
 ### Verify installation
 
 ```bash
@@ -339,6 +355,9 @@ internal analysis and debugging only.
 | [Circle Packing](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/circle_packing) | 26 circles in unit square; maximize sum of radii | Geometric optimization |
 | [2048](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/game_2048) | Evolve a policy to play 2048 | Game-playing / heuristic optimization |
 | [Julia Prime Counting](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/julia_prime_counting) | Optimize Julia prime-count queries | Algorithmic optimization |
+| [Go Collatz Steps](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/go_collatz_steps) | Optimize Go Collatz stopping-time queries | Algorithmic optimization |
+| [Fortran Heat Diffusion](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/fortran_heat_diffusion) | Optimize a compiled Fortran stencil solver | Numerical computing |
+| [Wolfram GCD Sum](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/wolfram_gcd_sum) | Optimize a Wolfram Language GCD-sum solver | Symbolic / numerical optimization |
 | [Novelty Generator](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/novelty_generator) | Diverse outputs scored by LLM-as-a-judge | Open-ended exploration |
 | [Tutorial Notebook](https://github.com/SakanaAI/ShinkaEvolve/blob/main/examples/shinka_tutorial.ipynb) | Guided walkthrough of Circle Packing and Novelty Generator | Interactive onboarding |
 
