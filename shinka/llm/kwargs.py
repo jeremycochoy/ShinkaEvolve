@@ -106,7 +106,7 @@ def sample_model_kwargs(
     api_model_name = resolved_model.api_model_name
     provider = resolved_model.provider
 
-    if provider == "headless":
+    if provider in ("headless", "claude_cli"):
         return kwargs_dict
 
     # 2. SAMPLE: reasoning effort
