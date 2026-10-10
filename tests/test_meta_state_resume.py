@@ -299,8 +299,9 @@ def launch(
     API cost of the search, the count of the meta updates of the launch, the
     state file, and the seconds from the last progress that the runner
     recorded). It also holds the state file and the
-    state in memory after each job, and the count of processed programs that
-    the state file holds at each write of an output file.
+    state in memory after each job, the count of processed programs that
+    the state file holds at each write of an output file, and the API cost
+    of the search at the end of the launch.
     """
     runner = make_runner(
         run_dir,
@@ -318,6 +319,7 @@ def launch(
         states=[],
         memory=[],
         saved_counts=[],
+        final_api_cost=None,
     )
     if runner.meta_summarizer:
         write_output = runner.meta_summarizer.write_meta_output_async
@@ -354,6 +356,7 @@ def launch(
     runner._job_monitor_task = complete_jobs
     runner._proposal_coordinator_task = no_proposals
     asyncio.run(runner.run_async())
+    seen.final_api_cost = runner.total_api_cost
     assert len(seen.states) == len(generations), "a job of the launch failed"
     return seen
 
@@ -365,6 +368,7 @@ def search(
     num_generations: int,
     stop_at: tuple[str, int] | None = None,
     job_ids: dict[int, str] | None = None,
+    totals: list[float] | None = None,
 ) -> list[str]:
     """Run one launch with the real job monitor and the real proposal coordinator.
 
@@ -375,6 +379,9 @@ def search(
     job_ids gives the identifier of the job of a generation. By default, each
     job has its own identifier.
 
+    totals gets the API cost of the search at each proposal, then at the end
+    of the launch.
+
     The result is the prompt of each proposal of the launch.
     """
     runner = make_runner(run_dir, meta_llm, meta_rec_interval, num_generations)
@@ -382,6 +389,14 @@ def search(
         (int(path.name[4:]) for path in run_dir.glob("gen_*")), default=0
     )
     runner.llm = StubProposalLLM(first_generation=last_generation + 1)
+    if totals is not None:
+        query = runner.llm.query
+
+        async def record_then_query(msg, system_msg, **kwargs):
+            totals.append(runner.total_api_cost)
+            return await query(msg, system_msg, **kwargs)
+
+        runner.llm.query = record_then_query
 
     async def submit_job(exec_fname, results_dir):
         generation_dir = Path(exec_fname).parent.name
@@ -412,11 +427,15 @@ def search(
             setattr(owner, method_name, stop_or_call)
         await asyncio.wait_for(runner.run_async(), timeout=60)
 
-    if stop_at:
-        with pytest.raises(asyncio.CancelledError):
+    try:
+        if stop_at:
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(run_search())
+        else:
             asyncio.run(run_search())
-    else:
-        asyncio.run(run_search())
+    finally:
+        if totals is not None:
+            totals.append(runner.total_api_cost)
     return runner.llm.prompts
 
 
@@ -1906,6 +1925,86 @@ def test_resume_starts_when_its_update_gives_an_error(tmp_path, monkeypatch):
     assert seen.first_recommendation == "Recommendation of launch 2 update 1."
     assert seen.start_state["total_programs_meta_processed"] == 6
     assert meta_files(run_dir) == ["meta_3.txt"]
+
+
+# The interval and the count of generations of a search whose first meta
+# update is on each path of the runner after the setup.
+SEARCH_PATHS = {"completed job": (2, 2), "resume": (2, 3), "final summary": (5, 2)}
+
+
+@pytest.mark.parametrize("path", SEARCH_PATHS)
+def test_failed_write_of_an_output_file_keeps_each_cost_in_the_cost_total(
+    tmp_path, monkeypatch, path
+):
+    run_dir = tmp_path / "run"
+    interval, num_generations = SEARCH_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    # Each write of an output file fails in launch 1.
+    meta_llm = StubMetaLLM("launch 1")
+    totals: list[float] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncMetaSummarizer, "_write_file", no_write)
+        prompts = search(run_dir, meta_llm, interval, num_generations, totals=totals)
+
+    # The cost total counts the cost of each update when its cost write
+    # commits. The failed write of the output file after it does not change
+    # that total.
+    paid = 0.01 * len(prompts) + update_costs(meta_llm.batches)
+    assert totals[-1] == pytest.approx(paid)
+    if path == "resume":
+        # The update of the resume comes before the first proposal.
+        assert "Recommendation of launch 1 update 1." in prompts[0]
+        assert totals[0] == pytest.approx(update_costs(meta_llm.batches[:1]))
+    state = read_state(run_dir)
+    assert len(state["meta_recommendations_history"]) == len(meta_llm.batches)
+    assert meta_files(run_dir) == []
+
+    # A resume, then a second resume: no new update. Each total holds each
+    # paid update one time, and the resume writes the missing output file.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=interval)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=interval)
+    assert second_llm.batches == third_llm.batches == []
+    assert second.api_cost == third.api_cost == pytest.approx(paid)
+    state = read_state(run_dir)
+    processed = state["total_programs_meta_processed"]
+    assert meta_files(run_dir) == [f"meta_{processed}.txt"]
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+
+
+def test_failed_write_of_the_output_file_of_the_setup_stops_the_launch_as_on_main(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    # The write of the output file of the update of the initial program fails.
+    meta_llm = StubMetaLLM("launch 1")
+    totals: list[float] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncMetaSummarizer, "_write_file", no_write)
+        with pytest.raises(OSError):
+            search(run_dir, meta_llm, 1, num_generations=2, totals=totals)
+
+    # The setup has no guard for an error of its meta update, thus the launch
+    # stops, as on main. Before the stop, the state file and the cost total
+    # took the update, and the database holds its cost.
+    paid = update_costs(meta_llm.batches)
+    assert meta_llm.batches == [[0]]
+    assert totals == [pytest.approx(paid)]
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    assert read_state(run_dir)["total_programs_meta_processed"] == 1
+
+    # The database holds generation 0 only, thus the next launch evaluates the
+    # initial program again, and it makes the update of that new program. It
+    # writes the missing output file, and its total holds each paid update.
+    second_llm = StubMetaLLM("launch 2")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=1)
+    assert second_llm.batches == [[0]]
+    assert second.api_cost == pytest.approx(paid + update_costs(second_llm.batches))
+    assert meta_files(run_dir) == ["meta_1.txt", "meta_2.txt"]
 
 
 def make_program(program_id: str, generation: int, score: float) -> Program:

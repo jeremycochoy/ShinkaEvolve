@@ -715,7 +715,8 @@ class ShinkaEvolveRunner:
         goes into the meta state: after a stop, the database holds the cost
         of each update of the state. The write waits in the write queue of the
         database, and the database adds the cost to its own value in one
-        transaction, one time for each update id.
+        transaction, one time for each update id. When the write commits, the
+        cost total of the launch counts the cost.
         """
         # The program in memory holds the cost first. Thus a write of its full
         # metadata holds the cost too, also when it takes its copy before a
@@ -730,6 +731,9 @@ class ShinkaEvolveRunner:
             raise ValueError(f"The database does not hold program {program.id}")
         # The database can hold the cost of other updates of the program
         program.metadata.update(stored)
+        # Count the cost here, thus an error or a time limit after the write,
+        # in the write of the output file for example, does not remove it
+        self.total_api_cost += meta_cost
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
     async def _summarize_waiting_programs(self) -> None:
@@ -754,7 +758,7 @@ class ShinkaEvolveRunner:
             # The final summary does what a resume needs: one update of all
             # waiting programs, the state, the output file, and the cost in
             # the database
-            _, meta_cost = await asyncio.wait_for(
+            await asyncio.wait_for(
                 self.meta_summarizer.perform_final_summary_async(
                     str(self.results_dir),
                     best_program,
@@ -763,7 +767,6 @@ class ShinkaEvolveRunner:
                 ),
                 timeout=META_SUMMARY_TIMEOUT,
             )
-            self.total_api_cost += meta_cost
         except asyncio.TimeoutError:
             logger.warning(
                 "⚠️  Meta update of the resume timed out, "
@@ -1261,8 +1264,6 @@ class ShinkaEvolveRunner:
                                 ),
                                 timeout=META_SUMMARY_TIMEOUT,
                             )
-                            if success and final_meta_cost > 0:
-                                self.total_api_cost += final_meta_cost
                             if self.verbose:
                                 if success and final_meta_cost > 0:
                                     logger.info(
@@ -1931,13 +1932,10 @@ class ShinkaEvolveRunner:
                     best_program, partial(self._store_meta_cost, initial_program)
                 )
                 if updated_recs:
-                    # Store meta cost for tracking
                     if meta_cost > 0:
                         logger.info(
                             f"Meta recommendation generation cost: ${meta_cost:.4f}"
                         )
-                        # Add meta cost to in-memory total for accurate budget tracking
-                        self.total_api_cost += meta_cost
                     # Save meta state before the output file, so that a resume does not repeat the update
                     self._save_meta_state()
                     # Write meta output file asynchronously
@@ -4597,8 +4595,6 @@ class ShinkaEvolveRunner:
                                     logger.info(
                                         f"Meta recommendation cost: ${meta_cost:.4f}"
                                     )
-                                    # Add meta cost to in-memory total for accurate budget tracking
-                                    self.total_api_cost += meta_cost
                                     metadata_persist_needed = True
                                 # Save meta state before the output file, so that a resume does not repeat the update
                                 self._save_meta_state()
