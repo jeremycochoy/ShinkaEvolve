@@ -652,30 +652,40 @@ class ShinkaEvolveRunner:
         """Load the meta summarizer state from disk, and complete it.
 
         A stop can come before the save of the state, or before the write of
-        an output file. Thus the load writes the output file of the last update
-        again when it is missing. It also puts each evaluated program of the
-        database that the state does not hold into the waiting list. A run
-        directory with no state file has an empty state.
+        an output file. Thus the load puts each evaluated program of the
+        database that the state does not hold into the waiting list. It also
+        writes the output file of the last update again when it is missing. A
+        run directory with no state file has an empty state. An error does not
+        stop the resume.
         """
         if self.meta_summarizer is None:
             return
-        self.meta_summarizer.load_meta_state(self._meta_state_path())
-        await self.meta_summarizer.restore_meta_output_async(str(self.results_dir))
-        programs = self.db.get_evaluated_programs()
-        for program in programs:
-            # SQLite gives 0 or 1, and the summary prints this value
-            program.correct = bool(program.correct)
-        self.meta_summarizer.add_unknown_programs(programs)
+        try:
+            self.meta_summarizer.load_meta_state(self._meta_state_path())
+            self.meta_summarizer.add_unknown_programs(self.db.get_evaluated_programs())
+            for program in self.meta_summarizer.evaluated_since_last_meta:
+                # A fresh search gives the summary a bool and a float. SQLite
+                # gives 0 or 1, and SQLite and the state file give no value
+                # for a NaN score
+                program.correct = bool(program.correct)
+                if program.combined_score is None:
+                    program.combined_score = float("nan")
+            await self.meta_summarizer.restore_meta_output_async(str(self.results_dir))
+        except Exception as e:
+            logger.warning(f"Failed to restore meta state: {e}")
 
     async def _summarize_waiting_programs(self) -> None:
-        """Run the meta update that is due, before the first proposal of a resume."""
+        """Run the meta update that is due, before the first proposal of a resume.
+
+        The time limit or an error does not stop the resume: the search starts.
+        """
         if self.meta_summarizer is None or not self.meta_summarizer.should_update_meta(
             self.evo_config.meta_rec_interval
         ):
             return
         logger.info("Updating meta memory before the first proposal of the resume...")
-        best_program = await self.async_db.get_best_program_async()
         try:
+            best_program = await self.async_db.get_best_program_async()
             # The final summary does what a resume needs: one update of all
             # waiting programs, the state, the output file, and the cost in
             # the database
@@ -694,6 +704,11 @@ class ShinkaEvolveRunner:
                 "⚠️  Meta update of the resume timed out, "
                 "the programs stay in the waiting list"
             )
+        except Exception as e:
+            logger.error(f"❌ Error in the meta update of the resume: {e}")
+        # The update can take minutes. Record progress, as the setup of a fresh
+        # search does, so that the stuck detection starts at this time
+        self._record_progress()
 
     async def _record_generation_event(
         self,

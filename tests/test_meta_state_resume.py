@@ -32,6 +32,11 @@ EVAL_RESULTS = {
     "correct": {"correct": True},
     "metrics": {"combined_score": 1.0, "public": {}, "private": {}},
 }
+# The evaluation of an incorrect program whose score is not a number.
+NAN_RESULTS = {
+    "correct": {"correct": False},
+    "metrics": {"combined_score": float("nan"), "public": {}, "private": {}},
+}
 PROGRAM = """# EVOLVE-BLOCK-START
 # GEN_{generation}
 value = {generation}
@@ -159,8 +164,12 @@ def make_runner(
     meta_llm: StubMetaLLM | None,
     meta_rec_interval: int,
     num_generations: int = 50,
+    nan_generations=(),
 ) -> ShinkaEvolveRunner:
-    """Build a runner on run_dir. Without a meta LLM, the meta summary is off."""
+    """Build a runner on run_dir. Without a meta LLM, the meta summary is off.
+
+    The evaluation of each generation of nan_generations gives a NaN score.
+    """
     init_path = run_dir.parent / "initial.py"
     init_path.write_text(PROGRAM.format(generation=0), encoding="utf-8")
     evo_config = EvolutionConfig(
@@ -184,7 +193,8 @@ def make_runner(
     )
 
     async def get_job_results(job_id, results_dir):
-        return EVAL_RESULTS
+        generation = int(re.search(r"(\d+)$", str(job_id)).group(1))
+        return NAN_RESULTS if generation in nan_generations else EVAL_RESULTS
 
     runner.scheduler.run = lambda exec_fname, results_dir: (EVAL_RESULTS, 0.0)
     runner.scheduler.get_job_results_async = get_job_results
@@ -248,20 +258,25 @@ def launch(
     meta_llm: StubMetaLLM | None,
     generations: list[int],
     meta_rec_interval: int = 3,
+    nan_generations=(),
 ) -> SimpleNamespace:
     """Run one launch of a search on run_dir, from the setup to the final summary.
 
     The launch completes one job for each generation of the list. The result
     holds what the first proposal of the launch sees (the recommendation, the
-    API cost of the search and the state file). It also holds the state file
-    and the state in memory after each job, and the count of processed programs
-    that the state file holds at each write of an output file.
+    API cost of the search, the state file, and the seconds from the last
+    progress that the runner recorded). It also holds the state file and the
+    state in memory after each job, and the count of processed programs that
+    the state file holds at each write of an output file.
     """
-    runner = make_runner(run_dir, meta_llm, meta_rec_interval)
+    runner = make_runner(
+        run_dir, meta_llm, meta_rec_interval, nan_generations=nan_generations
+    )
     seen = SimpleNamespace(
         first_recommendation=None,
         api_cost=None,
         start_state=None,
+        progress_age=None,
         states=[],
         memory=[],
         saved_counts=[],
@@ -280,6 +295,7 @@ def launch(
         try:
             seen.api_cost = runner.total_api_cost
             seen.start_state = read_state(run_dir)
+            seen.progress_age = time.time() - runner.last_progress_time
             if runner.meta_summarizer:
                 seen.first_recommendation = (
                     runner.meta_summarizer.get_sampled_recommendation()
@@ -838,6 +854,92 @@ def test_final_summary_stops_at_the_same_time_limit(tmp_path, monkeypatch):
     assert meta_llm.batches == [[0, 1]]
     assert waiting_generations(read_state(run_dir)) == [0, 1]
     assert not (run_dir / "meta").exists()
+
+
+def test_slow_update_of_a_resume_does_not_look_like_a_stuck_search(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    # Update 2 and the final summary of launch 1 give no recommendations.
+    launch(run_dir, StubMetaLLM("launch 1", failing_updates={2, 3}), [1, 2, 3, 4, 5])
+    monkeypatch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 1.0)
+
+    # The update of the resume takes the full second of its time limit.
+    seen = launch(run_dir, StubMetaLLM("launch 2", slow_updates={1}), generations=[])
+
+    # The proposal coordinator finds a stuck search from the time of the last
+    # progress. That time is the end of the update, not the start of the launch.
+    assert seen.progress_age < 0.5
+
+
+@pytest.mark.parametrize("first_launch_has_meta_summary", [False, True])
+def test_resume_summarizes_a_program_with_a_nan_score(
+    tmp_path, first_launch_has_meta_summary
+):
+    run_dir = tmp_path / "run"
+    # The evaluation of generation 1 gives a NaN score. The database and the
+    # state file keep no NaN, thus a resume gets this program with no score.
+    # With a meta summary, the final summary of launch 1 gives no
+    # recommendations, and the state file holds generations 0 and 1.
+    first_llm = (
+        StubMetaLLM("launch 1", failing_updates={1})
+        if first_launch_has_meta_summary
+        else None
+    )
+    launch(run_dir, first_llm, generations=[1], nan_generations={1})
+
+    meta_llm = StubMetaLLM("launch 2")
+    launch(run_dir, meta_llm, generations=[2])
+
+    # Generation 1 gets its summary, as it does in a fresh search.
+    assert meta_llm.batches == [[0, 1, 2]]
+    state = read_state(run_dir)
+    assert waiting_generations(state) == []
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (2, 2)]
+    assert "Patch Name patch_1 - Correct Program: False" in state["meta_summary"]
+
+
+def no_write(self, path, content):
+    raise OSError("The disk is full.")
+
+
+def test_resume_starts_when_the_write_of_the_missing_output_file_fails(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    launch(run_dir, StubMetaLLM("launch 1"), generations=[1, 2])
+    (run_dir / "meta" / "meta_3.txt").unlink()
+
+    # Each write of an output file fails in launch 2.
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncMetaSummarizer, "_write_file", no_write)
+        seen = launch(run_dir, StubMetaLLM("launch 2"), generations=[3])
+
+    # The search starts, and the final summary of the launch takes generation 3.
+    assert waiting_generations(seen.memory[0]) == [3]
+    assert read_state(run_dir)["total_programs_meta_processed"] == 4
+    assert meta_files(run_dir) == []
+
+    # The next resume writes the output file of the last update.
+    launch(run_dir, StubMetaLLM("launch 3"), generations=[])
+    assert meta_files(run_dir) == ["meta_4.txt"]
+
+
+def test_resume_starts_when_its_update_gives_an_error(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    # Update 2 and the final summary of launch 1 give no recommendations.
+    launch(run_dir, StubMetaLLM("launch 1", failing_updates={2, 3}), [1, 2, 3, 4, 5])
+    monkeypatch.setattr(AsyncMetaSummarizer, "_write_file", no_write)
+
+    meta_llm = StubMetaLLM("launch 2")
+    seen = launch(run_dir, meta_llm, generations=[])
+
+    # The update of the resume saves its state, then the write of its output
+    # file fails. The search starts with the recommendations of the update.
+    assert meta_llm.batches == [[3, 4, 5]]
+    assert seen.first_recommendation == "Recommendation of launch 2 update 1."
+    assert seen.start_state["total_programs_meta_processed"] == 6
+    assert meta_files(run_dir) == ["meta_3.txt"]
 
 
 def make_program(program_id: str, generation: int, score: float) -> Program:
