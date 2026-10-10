@@ -688,6 +688,19 @@ class ShinkaEvolveRunner:
         except Exception as e:
             logger.warning(f"Failed to restore meta state: {e}")
 
+    def _get_meta_costs(self) -> float:
+        """Get the cost of the meta updates that the database holds.
+
+        The sum is on the evaluated programs only: an island copy can repeat
+        the cost of its program.
+        """
+        if self.meta_summarizer is None:
+            return 0.0
+        return sum(
+            (program.metadata or {}).get("meta_cost") or 0.0
+            for program in self.db.get_evaluated_programs()
+        )
+
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
 
@@ -1328,10 +1341,11 @@ class ShinkaEvolveRunner:
             await self._restore_resume_progress()
         else:
             # A database with generation 0 only is not a resume: the launch
-            # evaluates the initial program again. But the meta state and the
-            # cost total follow the database
-            self.total_api_cost = await self._get_total_api_costs()
+            # evaluates the initial program again, and its cost total starts
+            # at 0. But the meta state follows the database, thus the cost
+            # total gets the cost of the meta updates of the database
             await self._load_meta_state()
+            self.total_api_cost += self._get_meta_costs()
 
             # Generate or copy initial program only if NOT resuming
             if (

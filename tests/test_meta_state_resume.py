@@ -469,6 +469,28 @@ def test_update_of_the_initial_program_writes_the_meta_state(tmp_path):
     assert next_launch.api_cost == pytest.approx(0.06)
 
 
+def test_launch_on_generation_0_only_adds_the_meta_costs_only(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+
+    async def paid_embedding(self, exec_fname):
+        return None, 0.5
+
+    # The embedding of each program costs 0.5. The island copy of the first
+    # program of generation 0 holds a copy of that cost.
+    monkeypatch.setattr(ShinkaEvolveRunner, "_get_code_embedding_async", paid_embedding)
+    first = launch(run_dir, StubMetaLLM("launch 1"), [], meta_rec_interval=1)
+    second = launch(run_dir, StubMetaLLM("launch 2"), [], meta_rec_interval=1)
+    third = launch(run_dir, None, generations=[])
+
+    # Launch 1 pays 1 embedding and the update of 1 program.
+    assert first.api_cost == pytest.approx(0.5 + 0.03)
+    # Launch 2 is not a resume, thus its other costs start at 0: it pays 1
+    # embedding. Its state holds 2 updates, thus its total holds their cost.
+    assert second.api_cost == pytest.approx(0.5 + 0.03 + 0.03)
+    # With no meta summary, such a launch has no state: its total is its own cost.
+    assert third.api_cost == pytest.approx(0.5)
+
+
 def test_launch_on_generation_0_only_continues_the_meta_state(tmp_path, caplog):
     run_dir = tmp_path / "run"
     # Launch 1 stops as a stop of the process does, after the update of
@@ -1228,6 +1250,32 @@ def test_get_evaluated_programs_orders_by_generation_and_skips_copies(tmp_path):
     evaluated = db.get_evaluated_programs()
 
     assert [program.id for program in evaluated] == ["gen-0", "gen-1", "gen-2", "gen-3"]
+    db.close()
+
+
+def test_meta_costs_of_the_database_skip_the_island_copies(tmp_path):
+    config = DatabaseConfig(
+        db_path=str(tmp_path / "programs.sqlite"),
+        num_islands=2,
+        enable_dynamic_islands=True,
+        stagnation_threshold=2,
+    )
+    db = ProgramDatabase(config=config, embedding_model="")
+    initial_program = make_program("gen-0", generation=0, score=1.0)
+    initial_program.metadata = {"meta_cost": 0.03}
+    db.add(initial_program)
+    # No generation is better than generation 0, thus the database makes a new
+    # island from a copy of the initial program.
+    for generation in (1, 2, 3):
+        db.add(make_program(f"gen-{generation}", generation, score=0.5))
+    # Each copy of the initial program repeats its meta cost.
+    stored = [program.metadata.get("meta_cost") for program in db.get_all_programs()]
+    assert sum(cost or 0.0 for cost in stored) > 0.03
+
+    runner = make_runner(tmp_path / "run", StubMetaLLM("launch 1"), meta_rec_interval=1)
+    runner.db = db
+
+    assert runner._get_meta_costs() == pytest.approx(0.03)
     db.close()
 
 
