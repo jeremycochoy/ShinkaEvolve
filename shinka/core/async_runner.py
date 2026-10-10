@@ -78,6 +78,10 @@ from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
 
+META_STATE_FILENAME = "meta_memory.json"
+# Seconds for the final meta summary, and for the meta update of a resume
+META_SUMMARY_TIMEOUT = 600.0
+
 
 def _print_gradient_logo_and_mirror(
     log_path: Optional[Path] = None,
@@ -634,6 +638,63 @@ class ShinkaEvolveRunner:
         except Exception as e:
             logger.warning(f"Failed to load bandit state: {e}")
 
+    def _meta_state_path(self) -> str:
+        """Get the path of the meta summarizer state file."""
+        return str(Path(self.results_dir) / META_STATE_FILENAME)
+
+    def _save_meta_state(self) -> None:
+        """Save the meta summarizer state to disk."""
+        if self.meta_summarizer is None:
+            return
+        self.meta_summarizer.save_meta_state(self._meta_state_path())
+
+    async def _load_meta_state(self) -> None:
+        """Load the meta summarizer state from disk, and complete it.
+
+        A stop can come before the save of the state, or before the write of
+        an output file. Thus the load writes the output file of the last update
+        again when it is missing. It also puts each evaluated program of the
+        database that the state does not hold into the waiting list. A run
+        directory with no state file has an empty state.
+        """
+        if self.meta_summarizer is None:
+            return
+        self.meta_summarizer.load_meta_state(self._meta_state_path())
+        await self.meta_summarizer.restore_meta_output_async(str(self.results_dir))
+        programs = self.db.get_evaluated_programs()
+        for program in programs:
+            # SQLite gives 0 or 1, and the summary prints this value
+            program.correct = bool(program.correct)
+        self.meta_summarizer.add_unknown_programs(programs)
+
+    async def _summarize_waiting_programs(self) -> None:
+        """Run the meta update that is due, before the first proposal of a resume."""
+        if self.meta_summarizer is None or not self.meta_summarizer.should_update_meta(
+            self.evo_config.meta_rec_interval
+        ):
+            return
+        logger.info("Updating meta memory before the first proposal of the resume...")
+        best_program = await self.async_db.get_best_program_async()
+        try:
+            # The final summary does what a resume needs: one update of all
+            # waiting programs, the state, the output file, and the cost in
+            # the database
+            _, meta_cost = await asyncio.wait_for(
+                self.meta_summarizer.perform_final_summary_async(
+                    str(self.results_dir),
+                    best_program,
+                    self.db.config,
+                    self._meta_state_path(),
+                ),
+                timeout=META_SUMMARY_TIMEOUT,
+            )
+            self.total_api_cost += meta_cost
+        except asyncio.TimeoutError:
+            logger.warning(
+                "⚠️  Meta update of the resume timed out, "
+                "the programs stay in the waiting list"
+            )
+
     async def _record_generation_event(
         self,
         generation: int,
@@ -1116,8 +1177,9 @@ class ShinkaEvolveRunner:
                                     str(self.results_dir),
                                     best_program,
                                     self.db.config,
+                                    self._meta_state_path(),
                                 ),
-                                timeout=600.0,  # 10 minute timeout for final meta summary
+                                timeout=META_SUMMARY_TIMEOUT,
                             )
                             if success and final_meta_cost > 0:
                                 self.total_api_cost += final_meta_cost
@@ -1145,6 +1207,9 @@ class ShinkaEvolveRunner:
 
             # Small delay to ensure all final operations are fully complete
             await asyncio.sleep(0.5)
+
+            # Save final meta state
+            self._save_meta_state()
 
             # Save final bandit state
             self._save_bandit_state()
@@ -1220,6 +1285,8 @@ class ShinkaEvolveRunner:
 
             logger.info("=" * 80)
             self._load_bandit_state()
+            await self._load_meta_state()
+            await self._summarize_waiting_programs()
 
             # Update state for resuming
             await self._restore_resume_progress()
@@ -1775,6 +1842,8 @@ class ShinkaEvolveRunner:
                     meta_cost,
                 ) = await self.meta_summarizer.update_meta_memory_async(best_program)
                 if updated_recs:
+                    # Save meta state first, so that a resume does not repeat the update
+                    self._save_meta_state()
                     # Write meta output file asynchronously
                     await self.meta_summarizer.write_meta_output_async(
                         str(self.results_dir)
@@ -4440,6 +4509,8 @@ class ShinkaEvolveRunner:
                                 best_program
                             )
                             if updated_recs:
+                                # Save meta state first, so that a resume does not repeat the update
+                                self._save_meta_state()
                                 # Write meta output file asynchronously
                                 await self.meta_summarizer.write_meta_output_async(
                                     str(self.results_dir)

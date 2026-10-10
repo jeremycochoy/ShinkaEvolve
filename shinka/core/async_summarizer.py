@@ -46,6 +46,7 @@ class AsyncMetaSummarizer:
         """
         Async version of update_meta_memory.
         Perform 3-step meta-analysis and update internal state.
+        A program with no step 1 answer stays in the waiting list.
         Returns tuple of (updated_recommendations, total_cost) or
         (None, 0.0) if no update occurred.
         """
@@ -70,6 +71,7 @@ class AsyncMetaSummarizer:
         try:
             # Step 1: Create individual program summaries
             (
+                summarized_programs,
                 individual_summaries,
                 step1_cost,
             ) = await self._step1_individual_summaries_async(programs_to_analyze)
@@ -126,15 +128,22 @@ class AsyncMetaSummarizer:
             logger.error(f"Failed to complete 3-step meta-analysis: {e}")
             return None, total_meta_cost
 
-        # Clear the evaluated programs list immediately after processing
-        # This ensures that only programs added AFTER this meta update
-        # will be saved as "unprocessed" programs
-        num_processed = len(self.sync_summarizer.evaluated_since_last_meta)
+        # Remove only the summarized programs from the evaluated programs list
+        # A program with no step 1 answer stays there, and the next meta
+        # update tries it again
+        summarized_ids = [p.id for p in summarized_programs]
+        num_processed = len(summarized_ids)
         self.sync_summarizer.total_programs_processed += num_processed
-        self.sync_summarizer.evaluated_since_last_meta = []
+        self.sync_summarizer.processed_program_ids.extend(summarized_ids)
+        self.sync_summarizer.evaluated_since_last_meta = [
+            p
+            for p in self.sync_summarizer.evaluated_since_last_meta
+            if p.id not in summarized_ids
+        ]
         logger.info(
             f"Processed and cleared {num_processed} programs from meta memory "
-            f"(total processed: {self.sync_summarizer.total_programs_processed})"
+            f"(total processed: {self.sync_summarizer.total_programs_processed}, "
+            f"waiting: {len(self.sync_summarizer.evaluated_since_last_meta)})"
         )
 
         return (
@@ -148,79 +157,74 @@ class AsyncMetaSummarizer:
 
     async def _step1_individual_summaries_async(
         self, programs_to_analyze: List[Program]
-    ) -> Tuple[Optional[str], float]:
-        """Async version of Step 1: Create individual summaries for each program using batch queries."""
+    ) -> Tuple[List[Program], str, float]:
+        """Async version of Step 1: Create individual summaries for each program using concurrent queries.
+
+        Returns the programs that got a summary, their combined summaries and
+        the cost of all queries.
+        """
         if not programs_to_analyze:
             logger.warning("No programs to analyze in Step 1")
-            return None, 0.0
+            return [], "", 0.0
 
-        # Create individual program messages for batch processing
-        user_messages, generation_ids, patch_names, correct_programs = [], [], [], []
-        for program in programs_to_analyze:
+        # Use one query for each program, all at the same time. Each query
+        # gives its program back, thus a summary always has the identifier
+        # of its program
+        num_programs = len(programs_to_analyze)
+        logger.info(
+            f"==> Step 1 - Processing {num_programs} programs with concurrent async queries"
+        )
+        results = await asyncio.gather(
+            *(self.summarize_program_async(p) for p in programs_to_analyze)
+        )
+        total_cost = sum(cost for _, _, cost in results)
+        summarized = [(program, summary) for program, summary, _ in results if summary]
+        logger.info(
+            f"==> Step 1 - {len(summarized)}/{num_programs} "
+            f"individual summaries generated (cost: ${total_cost:.4f})"
+        )
+
+        # Sort the summaries by generation, then join them with double newlines
+        summaries_by_gen = sorted(summarized, key=lambda x: x[0].generation)
+        final_summary = "\n\n".join(summary for _, summary in summaries_by_gen)
+        return [program for program, _ in summarized], final_summary, total_cost
+
+    async def summarize_program_async(
+        self, program: Program
+    ) -> Tuple[Program, Optional[str], float]:
+        """Step 1 for one program: query its summary and add its identifier.
+
+        Returns the program, its summary and the cost of the query. The
+        summary is None when the answer is missing or blank, or after an error.
+        """
+        summary, cost = None, 0.0
+        try:
             individual_program_msg = construct_individual_program_msg(
                 program,
                 language=self.sync_summarizer.language,
                 include_text_feedback=self.sync_summarizer.use_text_feedback,
             )
-            generation_ids.append(program.generation)
-            patch_names.append(program.metadata["patch_name"])
-            correct_programs.append(program.correct)
             user_msg = META_STEP1_USER_MSG.replace(
                 "{individual_program_msg}", individual_program_msg
             )
-            user_messages.append(user_msg)
+            response = await self.async_llm_client.query(
+                msg=user_msg,
+                system_msg=META_STEP1_SYSTEM_MSG,
+            )
+            if response is not None:
+                cost = response.cost or 0.0
+                if response.content and response.content.strip():
+                    identifier = f"Generation {program.generation} - Patch Name {program.metadata['patch_name']} - Correct Program: {program.correct}"
+                    summary = f"{response.content.strip()}\n**Program Identifier:** {identifier}"
+        except Exception as e:
+            logger.error(f"Step 1: Error for program {program.id}: {e}")
 
-        # Use async batch query to process all programs
-        num_programs = len(programs_to_analyze)
-        logger.info(
-            f"==> Step 1 - Processing {num_programs} programs with async batch query"
-        )
-        responses = await self.async_llm_client.batch_kwargs_query(
-            num_samples=num_programs,
-            msg=user_messages,
-            system_msg=META_STEP1_SYSTEM_MSG,
-        )
-
-        if not responses:
-            logger.error("Step 1: Failed to get responses from async meta LLM client")
-            return None, 0.0
-
-        # Filter out None responses and combine summaries
-        valid_responses = [r for r in responses if r is not None]
-        if not valid_responses:
-            logger.error("Step 1: All batch responses were None")
-            return None, 0.0
-
-        # Combine all individual summaries
-        combined_summaries = []
-        total_cost = 0.0
-        for i, response in enumerate(valid_responses):
-            if response and response.content:
-                program_summary = response.content.strip()
-                program_summary += "\n**Program Identifier:** "
-                program_summary += f"Generation {generation_ids[i]} - Patch Name {patch_names[i]} - Correct Program: {correct_programs[i]}"
-                combined_summaries.append(program_summary)
-                total_cost += response.cost or 0.0
-            else:
-                logger.warning(f"Step 1: Empty response for program {i}")
-
-        # Sort combined_summaries by generation (using generation_ids)
-        # Zip together summaries and their generation, sort, then extract summaries
-        summaries_with_gen = list(zip(generation_ids, combined_summaries))
-        summaries_with_gen.sort(key=lambda x: x[0])
-        combined_summaries = [summary for _, summary in summaries_with_gen]
-
-        if not combined_summaries:
-            logger.error("Step 1: No valid summaries generated")
-            return None, total_cost
-
-        # Join all summaries with double newlines
-        final_summary = "\n\n".join(combined_summaries)
-        logger.info(
-            f"==> Step 1 - {len(combined_summaries)}/{num_programs} "
-            f"individual summaries generated (cost: ${total_cost:.4f})"
-        )
-        return final_summary, total_cost
+        if summary is None:
+            logger.warning(
+                f"Step 1: No summary for program {program.id} "
+                f"(generation {program.generation})"
+            )
+        return program, summary, cost
 
     async def _step2_global_insights_async(
         self, individual_summaries: str, best_program: Optional[Program] = None
@@ -305,8 +309,12 @@ class AsyncMetaSummarizer:
         results_dir: str,
         best_program: Optional[Program] = None,
         db_config=None,
+        state_path: Optional[str] = None,
     ) -> tuple[bool, float]:
         """Async version of perform_final_summary.
+
+        With a state_path, the state of the update goes to that file before
+        the output file.
 
         Returns:
             Tuple of (success, meta_cost)
@@ -327,6 +335,9 @@ class AsyncMetaSummarizer:
 
         updated_recs, meta_cost = await self.update_meta_memory_async(best_program)
         if updated_recs:
+            # Save the state first, so that a resume does not repeat the update
+            if state_path:
+                self.save_meta_state(state_path)
             await self.write_meta_output_async(results_dir)
             logger.info(f"Final meta summary completed (cost: ${meta_cost:.4f})")
 
@@ -406,26 +417,39 @@ class AsyncMetaSummarizer:
 
         if output_str:
             # Create meta subdirectory if it doesn't exist
-            meta_dir = Path(results_dir) / "meta"
-            meta_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = self.sync_summarizer.get_meta_output_path(results_dir)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
 
-            meta_path = (
-                meta_dir / f"meta_{self.sync_summarizer.total_programs_processed}.txt"
-            )
             # Write file in thread pool to avoid blocking event loop
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._write_file, meta_path, output_str)
             logger.info(f"Wrote meta output to {meta_path}")
 
+    async def restore_meta_output_async(self, results_dir: str) -> None:
+        """Write the output file of the last meta update again when it is missing."""
+        if (
+            self.sync_summarizer.total_programs_processed > 0
+            and not self.sync_summarizer.get_meta_output_path(results_dir).exists()
+        ):
+            await self.write_meta_output_async(results_dir)
+
     def _write_file(self, path: Path, content: str) -> None:
         """Helper to write file synchronously (for thread pool)."""
-        with path.open("w", encoding="utf-8") as f:
+        # Write to a temporary file first, then rename it: a stop leaves no
+        # partial output file
+        temp_path = path.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
             f.write(content)
+        temp_path.replace(path)
 
     # Delegate read-only methods to sync summarizer
     def add_evaluated_program(self, program: Program) -> None:
         """Add newly evaluated program to the tracking list."""
         return self.sync_summarizer.add_evaluated_program(program)
+
+    def add_unknown_programs(self, programs: List[Program]) -> None:
+        """Add each program that the state does not hold (delegated to sync)."""
+        return self.sync_summarizer.add_unknown_programs(programs)
 
     def should_update_meta(self, meta_rec_interval: Optional[int]) -> bool:
         """Check if meta update should be performed based on interval."""

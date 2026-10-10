@@ -1662,6 +1662,24 @@ class ProgramDatabase:
         # Filter out any None values that might result from row processing errors
         return [p for p in programs if p is not None]
 
+    def get_evaluated_programs(self) -> List[Program]:
+        """Get each evaluated program, in the order of the generations.
+
+        The island manager copies a program to seed an island, and a proposal
+        can fail before its evaluation. These rows have no evaluation of their
+        own, thus they are not in the list.
+        """
+        programs = [
+            p
+            for p in self.get_all_programs()
+            if not (
+                p.metadata.get("_is_island_copy")
+                or p.metadata.get("_spawned_island")
+                or p.metadata.get("node_kind") == "failed_proposal"
+            )
+        ]
+        return sorted(programs, key=lambda p: (p.generation, p.timestamp))
+
     @db_retry()
     def get_programs_summary(self) -> List[Dict[str, Any]]:
         """

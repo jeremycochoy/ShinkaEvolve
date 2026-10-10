@@ -26,6 +26,16 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ### Fixed
 
+- Fixed the async runner so the meta summary continues across a resume. The
+  runner saves the meta state to `meta_memory.json` in the results directory
+  after each meta update and at the end of a run. A resume loads that file,
+  adds each evaluated program of the database that the state does not hold,
+  and makes the meta update that is due before the first new proposal.
+- Fixed step 1 of the async meta update to make one query for each program, so
+  each summary keeps the identifier of its program. Before, a failed answer
+  gave the later summaries the identifier of another program, and its program
+  got no summary. A program with a missing or blank answer now waits for the
+  next update.
 - Fixed Azure OpenAI LLM client construction to use the v1 base URL contract,
   avoiding doubled `/openai/v1/openai` request paths and 404 responses reported
   in issue #147.
