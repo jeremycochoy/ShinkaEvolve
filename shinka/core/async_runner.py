@@ -703,17 +703,25 @@ class ShinkaEvolveRunner:
         )
 
     async def _store_meta_cost(self, program: Program, meta_cost: float) -> None:
-        """Write the cost of a meta update to the database.
+        """Add the cost of a meta update to the metadata of a program in the database.
 
-        The cost goes to the metadata of the program that started the update.
-        The update calls this write before its result goes into the meta
-        state: after a stop, the database holds the cost of each update of
-        the state. The write adds the cost in the database, as the update of
-        a resume and the final summary do.
+        Each meta update writes its cost with this method. The update of a
+        completed job and of the initial program write to the program that
+        started the update. The update of a resume and the final summary write
+        to the best program. The update calls this write before its result
+        goes into the meta state: after a stop, the database holds the cost
+        of each update of the state. The write waits in the write queue of the
+        database, and the database adds the cost to its own value in one
+        transaction. The metadata of the program then gets the new value.
         """
-        await self.meta_summarizer.store_meta_cost_async(
-            program, self.db.config, meta_cost
-        )
+        stored_cost = await self.async_db.add_meta_cost_async(program.id, meta_cost)
+        if stored_cost is None:
+            raise ValueError(f"The database does not hold program {program.id}")
+        # A later write of the full metadata of the program keeps this value
+        if program.metadata is None:
+            program.metadata = {}
+        program.metadata["meta_cost"] = stored_cost
+        logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
@@ -741,7 +749,7 @@ class ShinkaEvolveRunner:
                 self.meta_summarizer.perform_final_summary_async(
                     str(self.results_dir),
                     best_program,
-                    self.db.config,
+                    partial(self._store_meta_cost, best_program),
                     self._meta_state_path(),
                 ),
                 timeout=META_SUMMARY_TIMEOUT,
@@ -1239,7 +1247,7 @@ class ShinkaEvolveRunner:
                                 self.meta_summarizer.perform_final_summary_async(
                                     str(self.results_dir),
                                     best_program,
-                                    self.db.config,
+                                    partial(self._store_meta_cost, best_program),
                                     self._meta_state_path(),
                                 ),
                                 timeout=META_SUMMARY_TIMEOUT,

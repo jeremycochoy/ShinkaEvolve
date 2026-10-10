@@ -722,6 +722,32 @@ class AsyncProgramDatabase:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.write_executor, update_metadata_sync)
 
+    async def add_meta_cost_async(
+        self, program_id: str, meta_cost: float
+    ) -> Optional[float]:
+        """Add the cost of a meta update to a program on the dedicated writer lane.
+
+        The write waits in the queue of the other writes, thus it does not
+        compete with them for the write lock of the database. Returns the new
+        meta cost of the program, or None when the database does not hold the
+        program.
+        """
+
+        def add_meta_cost_sync() -> Optional[float]:
+            thread_db = None
+            try:
+                thread_db = ProgramDatabase(
+                    self.sync_db.config,
+                    embedding_model=self.sync_db.embedding_model,
+                )
+                return thread_db.add_meta_cost(program_id, meta_cost)
+            finally:
+                if thread_db is not None:
+                    thread_db.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.write_executor, add_meta_cost_sync)
+
     def _schedule_embedding_recomputation(self):
         """Schedule embedding recomputation as a background task."""
         # Cancel any existing recomputation task

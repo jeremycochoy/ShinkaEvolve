@@ -9,6 +9,7 @@ test starts a search or calls an LLM.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -28,6 +29,7 @@ from shinka.core.async_runner import AsyncRunningJob
 from shinka.core.async_summarizer import AsyncMetaSummarizer
 from shinka.core.summarizer import MetaSummarizer
 from shinka.database import DatabaseConfig, Program, ProgramDatabase
+from shinka.database.async_dbase import AsyncProgramDatabase
 from shinka.launch import LocalJobConfig
 from shinka.pricing.catalog import PricingConfig, PricingMode, refresh_model_catalog
 from shinka.prompts import (
@@ -177,10 +179,13 @@ def make_runner(
     meta_rec_interval: int,
     num_generations: int = 50,
     nan_generations=(),
+    max_db_workers: int = 2,
 ) -> ShinkaEvolveRunner:
     """Build a runner on run_dir. Without a meta LLM, the meta summary is off.
 
     The evaluation of each generation of nan_generations gives a NaN score.
+    max_db_workers gives the count of workers of the write queue of the
+    database (2 is the default of the runner).
     """
     init_path = run_dir.parent / "initial.py"
     init_path.write_text(PROGRAM.format(generation=0), encoding="utf-8")
@@ -202,6 +207,7 @@ def make_runner(
         DatabaseConfig(num_islands=2),
         verbose=False,
         max_evaluation_jobs=1,
+        max_db_workers=max_db_workers,
     )
 
     async def get_job_results(job_id, results_dir):
@@ -273,6 +279,7 @@ def launch(
     generations: list[int],
     meta_rec_interval: int = 3,
     nan_generations=(),
+    max_db_workers: int = 2,
 ) -> SimpleNamespace:
     """Run one launch of a search on run_dir, from the setup to the final summary.
 
@@ -285,7 +292,11 @@ def launch(
     the state file holds at each write of an output file.
     """
     runner = make_runner(
-        run_dir, meta_llm, meta_rec_interval, nan_generations=nan_generations
+        run_dir,
+        meta_llm,
+        meta_rec_interval,
+        nan_generations=nan_generations,
+        max_db_workers=max_db_workers,
     )
     seen = SimpleNamespace(
         first_recommendation=None,
@@ -953,26 +964,26 @@ def test_stop_in_the_update_of_the_initial_program_keeps_each_cost(
     )
 
 
-def slow_cost_database(db_config):
-    """Take the place of the database of a cost write that is slow.
+def slow_cost_write(db, program_id, meta_cost):
+    """Take the place of the cost write of a meta update when it is slow.
 
-    Each meta update writes its cost in a worker thread. That thread opens
-    `shinka.database.ProgramDatabase`, and no other write of a launch uses
-    that name. Here the write takes 0.5 seconds, which is more than the time
-    limit of the test. Then the process stops, thus the write does not occur.
+    Each meta update writes its cost with `ProgramDatabase.add_meta_cost()`
+    in a worker thread, and no other write of a launch uses that method. Here
+    the write takes 0.5 seconds, which is more than the time limit of the
+    test. Then the process stops, thus the write does not occur.
     """
     time.sleep(0.5)
     raise RuntimeError("The process stopped before the write of the cost.")
 
 
-def locked_cost_database(db_config):
-    """Take the place of the same database when the write of the cost fails."""
+def locked_cost_write(db, program_id, meta_cost):
+    """Take the place of the same write when the database is locked."""
     raise sqlite3.OperationalError("database is locked")
 
 
 def fail_cost_writes(patch) -> None:
     """Make each write of a meta cost to the database fail."""
-    patch.setattr("shinka.database.ProgramDatabase", locked_cost_database)
+    patch.setattr(ProgramDatabase, "add_meta_cost", locked_cost_write)
 
 
 @pytest.mark.parametrize("path", ["resume", "final summary"])
@@ -990,7 +1001,7 @@ def test_time_limit_in_the_cost_write_of_an_update_keeps_each_cost(
     first_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
         patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 0.1)
-        patch.setattr("shinka.database.ProgramDatabase", slow_cost_database)
+        patch.setattr(ProgramDatabase, "add_meta_cost", slow_cost_write)
         prompts = search(
             run_dir, first_llm, interval, 2, stop_at=("_save_bandit_state", 1)
         )
@@ -1082,24 +1093,25 @@ def test_failed_cost_write_of_the_initial_program_update_keeps_each_cost(
     tmp_path, monkeypatch
 ):
     run_dir = tmp_path / "run"
-    opened = []
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    calls = []
 
-    def fail_the_first_cost_write(db_config):
-        opened.append(db_config)
-        if len(opened) == 1:
-            return locked_cost_database(db_config)
-        return ProgramDatabase(db_config)
+    def fail_the_first_cost_write(db, program_id, meta_cost):
+        calls.append(program_id)
+        if len(calls) == 1:
+            return locked_cost_write(db, program_id, meta_cost)
+        return add_meta_cost(db, program_id, meta_cost)
 
     # Launch 1 pays the update of the initial program, and the write of its
     # cost fails.
     first_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
-        patch.setattr("shinka.database.ProgramDatabase", fail_the_first_cost_write)
+        patch.setattr(ProgramDatabase, "add_meta_cost", fail_the_first_cost_write)
         first = launch(run_dir, first_llm, generations=[], meta_rec_interval=1)
 
     # The update gives no result, and the launch continues: the search starts
     # with the program in the waiting list, and the final summary takes it.
-    assert len(opened) == 2
+    assert len(calls) == 2
     assert first.first_recommendation is None
     assert first.start_state is None
     assert first_llm.batches == [[0], [0]]
@@ -1128,34 +1140,30 @@ class RisingPriceMetaLLM(StubMetaLLM):
 
 
 class OlderCostWriteCommitsLast:
-    """Take the place of the database of each cost write, in its worker thread.
+    """Take the place of each cost write, in its worker thread.
 
-    The first cost write waits until the second cost write closes its
-    database. Thus the older write commits last.
+    The first cost write waits until the second cost write commits. Thus the
+    older write commits last.
     """
 
-    def __init__(self):
-        self.second_write_closed = threading.Event()
-        self.opened = []
+    def __init__(self, patch):
+        self.second_write_committed = threading.Event()
+        self.calls = itertools.count(1)
         # The number of each cost write, in the order of the commits.
-        self.closed = []
+        self.committed = []
+        add_meta_cost = ProgramDatabase.add_meta_cost
 
-    def __call__(self, db_config):
-        self.opened.append(db_config)
-        number = len(self.opened)
-        if number == 1:
-            assert self.second_write_closed.wait(timeout=30)
-        db = ProgramDatabase(db_config)
-        close = db.close
-
-        def close_and_record():
-            close()
-            self.closed.append(number)
+        def write_in_this_order(db, program_id, meta_cost):
+            number = next(self.calls)
+            if number == 1:
+                assert self.second_write_committed.wait(timeout=30)
+            stored_cost = add_meta_cost(db, program_id, meta_cost)
+            self.committed.append(number)
             if number == 2:
-                self.second_write_closed.set()
+                self.second_write_committed.set()
+            return stored_cost
 
-        db.close = close_and_record
-        return db
+        patch.setattr(ProgramDatabase, "add_meta_cost", write_in_this_order)
 
 
 def test_older_cost_write_that_commits_last_keeps_each_cost(tmp_path, monkeypatch):
@@ -1167,14 +1175,13 @@ def test_older_cost_write_that_commits_last_keeps_each_cost(tmp_path, monkeypatc
     # Then the final summary makes the update again, at a higher price, and
     # its cost write commits first. The cut write commits last.
     first_llm = RisingPriceMetaLLM("launch 1")
-    order = OlderCostWriteCommitsLast()
     with monkeypatch.context() as patch:
         patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 2.0)
-        patch.setattr("shinka.database.ProgramDatabase", order)
+        order = OlderCostWriteCommitsLast(patch)
         prompts = search(run_dir, first_llm, 2, num_generations=2)
     assert prompts == []
     assert first_llm.batches == [[0, 1], [0, 1]]
-    assert order.closed == [2, 1]
+    assert order.committed == [2, 1]
     state = read_state(run_dir)
     assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 2."
     assert state["total_programs_meta_processed"] == 2
@@ -1271,6 +1278,88 @@ def test_cost_write_of_each_update_adds_to_the_cost_in_the_database(tmp_path, pa
     )
 
 
+def record_async_databases(patch) -> list[AsyncProgramDatabase]:
+    """Record each async database that a runner builds."""
+    databases = []
+    build = AsyncProgramDatabase.__init__
+
+    def build_and_record(self, *args, **kwargs):
+        build(self, *args, **kwargs)
+        databases.append(self)
+
+    patch.setattr(AsyncProgramDatabase, "__init__", build_and_record)
+    return databases
+
+
+class ProgramWriteAtStep3MetaLLM(StubMetaLLM):
+    """Answer as StubMetaLLM. At step 3 of update 1, a program write starts in
+    the write queue of the database of the launch. It holds the write lock of
+    the database for 0.5 seconds. The stub records the thread of that write."""
+
+    def __init__(self, name: str, run_dir: Path, databases: list):
+        super().__init__(name)
+        self.run_dir = run_dir
+        self.databases = databases
+        self.threads: dict[str, threading.Thread] = {}
+
+    def write_a_program(self, has_the_lock: threading.Event) -> None:
+        conn = sqlite3.connect(self.run_dir / "programs.sqlite", timeout=60)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self.threads["program write"] = threading.current_thread()
+            has_the_lock.set()
+            time.sleep(0.5)
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def query(self, msg, system_msg):
+        if system_msg == META_STEP3_SYSTEM_MSG and not self.step3_messages:
+            has_the_lock = threading.Event()
+            write_queue = self.databases[-1].write_executor
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(write_queue, self.write_a_program, has_the_lock)
+            for _ in range(500):
+                if has_the_lock.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert has_the_lock.is_set()
+        return await super().query(msg, system_msg)
+
+
+@pytest.mark.parametrize("path", COST_WRITE_PATHS)
+def test_cost_write_waits_in_the_write_queue_of_the_database(
+    tmp_path, monkeypatch, path
+):
+    run_dir = tmp_path / "run"
+    interval, generations = COST_WRITE_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    # A program write holds the write lock when step 3 of the update ends.
+    meta_llm = ProgramWriteAtStep3MetaLLM(
+        "launch 1", run_dir, record_async_databases(monkeypatch)
+    )
+    add_meta_cost = ProgramDatabase.add_meta_cost
+
+    def record_the_cost_write(db, program_id, meta_cost):
+        meta_llm.threads["cost write"] = threading.current_thread()
+        return add_meta_cost(db, program_id, meta_cost)
+
+    monkeypatch.setattr(ProgramDatabase, "add_meta_cost", record_the_cost_write)
+
+    # The write queue of the database has 1 worker.
+    launch(run_dir, meta_llm, generations, meta_rec_interval=interval, max_db_workers=1)
+
+    # The cost write waits in the write queue: the one worker of the queue
+    # makes it after the program write. Thus the 2 writes do not compete for
+    # the write lock. The queue is open at the cost write, also at the final
+    # summary, thus the database holds the cost.
+    assert len(meta_llm.batches) == 1
+    assert meta_llm.threads["cost write"] is meta_llm.threads["program write"]
+    assert stored_meta_costs(run_dir) == pytest.approx(update_costs(meta_llm.batches))
+
+
 def make_summarizer(meta_llm: StubMetaLLM) -> AsyncMetaSummarizer:
     """Build a meta summarizer with generations 0 and 1 in its waiting list."""
     summarizer = AsyncMetaSummarizer(MetaSummarizer(async_mode=True), meta_llm)
@@ -1335,14 +1424,21 @@ def test_cost_write_to_a_program_that_the_database_does_not_hold_gives_no_update
     tmp_path,
 ):
     config = DatabaseConfig(db_path=str(tmp_path / "programs.sqlite"), num_islands=1)
-    ProgramDatabase(config=config, embedding_model="").close()
+    db = ProgramDatabase(config=config, embedding_model="")
+    runner = make_runner(tmp_path / "run", StubMetaLLM("launch 1"), 2)
     summarizer = make_summarizer(StubMetaLLM("launch 1"))
     program = make_program("gen-9", generation=9, score=1.0)
-    store_cost = partial(summarizer.store_meta_cost_async, program, config)
 
-    recommendations, _ = asyncio.run(
-        summarizer.update_meta_memory_async(None, store_cost)
-    )
+    async def update():
+        runner.async_db = AsyncProgramDatabase(db)
+        try:
+            store_cost = partial(runner._store_meta_cost, program)
+            return await summarizer.update_meta_memory_async(None, store_cost)
+        finally:
+            await runner.async_db.close_async()
+            db.close()
+
+    recommendations, _ = asyncio.run(update())
 
     # The database holds no cost of the update, thus the update gives no result.
     assert recommendations is None

@@ -35,7 +35,8 @@ All notable changes to `shinka-evolve` are documented in this file.
   the value in the database before its result goes into the state. The add
   reads and writes in one transaction, so a late cost write never replaces
   another one, and the cost total of a later launch holds the cost of each
-  update of the state. When that write fails, or when the time limit of the
+  update of the state. The cost write waits in the write queue of the
+  database, as the other writes of a program do. When that write fails, or when the time limit of the
   update passes in it, the update gives no result and its programs wait for
   the next update.
 - Fixed step 1 of the async meta update to make one query for each program, so
