@@ -1676,25 +1676,38 @@ def test_each_save_holds_the_updates_whose_cost_the_database_holds(
     ]
 
 
-def test_resume_with_no_generation_left_and_no_best_program_makes_the_update(
-    tmp_path, caplog
+@pytest.mark.parametrize("budget_used", [False, True])
+def test_resume_with_no_later_update_makes_the_update_with_no_best_program(
+    tmp_path, caplog, budget_used
 ):
     run_dir = tmp_path / "run"
     # An older results directory: 3 programs that are not correct, and no
     # state file. Thus the database has no best program.
     launch(run_dir, None, generations=[1, 2], nan_generations={0, 1, 2})
     assert read_state(run_dir) is None
+    # Each resume has no generation left, or generations left and a cost
+    # budget that the stored costs reach.
+    num_generations, max_api_costs = (10, 0.0) if budget_used else (3, None)
 
-    # A resume with no generation left, and fewer waiting programs than the
-    # interval. Then a second resume and a third resume.
+    # A resume with fewer waiting programs than the interval. Then a second
+    # resume and a third resume.
     llms = [StubMetaLLM(f"launch {number}") for number in (1, 2, 3)]
     totals: list[list[float]] = [[], [], []]
     for meta_llm, launch_totals in zip(llms, totals):
-        assert search(run_dir, meta_llm, 5, 3, totals=launch_totals) == []
+        prompts = search(
+            run_dir,
+            meta_llm,
+            5,
+            num_generations,
+            totals=launch_totals,
+            max_api_costs=max_api_costs,
+        )
+        assert prompts == []
 
-    # With no best program, no final summary comes. Thus the first resume
-    # summarizes the 3 programs whatever the interval, and it writes the cost
-    # to a waiting program. The later resumes make no update.
+    # No proposal comes, and with no best program, no final summary comes.
+    # Thus the first resume summarizes the 3 programs whatever the interval,
+    # and it writes the cost to a waiting program. The later resumes make no
+    # update.
     assert [meta_llm.batches for meta_llm in llms] == [[[0, 1, 2]], [], []]
     paid = update_costs(llms[0].batches)
     assert stored_meta_costs(run_dir) == pytest.approx(paid)
