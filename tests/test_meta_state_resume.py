@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -338,8 +339,7 @@ def search(
 
     stop_at gives a method of the runner or of its meta summarizer, and a call
     number. The launch then ends at that call as a stop of the process does:
-    the call does not run, and the launch makes no final summary and no final
-    save.
+    the call does not run, and no later step of the launch runs.
 
     The result is the prompt of each proposal of the launch.
     """
@@ -907,6 +907,250 @@ def test_stop_in_the_update_of_the_initial_program_keeps_each_cost(
     assert sorted(state["processed_program_ids"]) == sorted(
         evaluated_program_ids(run_dir)
     )
+
+
+def slow_cost_database(db_config):
+    """Take the place of the database of a cost write that is slow.
+
+    The update of a resume and the final summary write their cost in a worker
+    thread. That thread opens `shinka.database.ProgramDatabase`, and no other
+    write of a launch uses that name. Here the write takes 0.5 seconds, which
+    is more than the time limit of the test. Then the process stops, thus the
+    write does not occur.
+    """
+    time.sleep(0.5)
+    raise RuntimeError("The process stopped before the write of the cost.")
+
+
+def locked_cost_database(db_config):
+    """Take the place of the same database when the write of the cost fails."""
+    raise sqlite3.OperationalError("database is locked")
+
+
+def fail_cost_writes(patch) -> None:
+    """Make each write of a meta cost to the database fail."""
+    persist = ShinkaEvolveRunner._persist_program_metadata_async
+
+    async def persist_or_fail(runner, program):
+        # The update of a completed job and the update of the initial program
+        # write their cost with the metadata of a program.
+        if "meta_cost" in (program.metadata or {}):
+            raise sqlite3.OperationalError("database is locked")
+        await persist(runner, program)
+
+    patch.setattr(
+        ShinkaEvolveRunner, "_persist_program_metadata_async", persist_or_fail
+    )
+    patch.setattr("shinka.database.ProgramDatabase", locked_cost_database)
+
+
+@pytest.mark.parametrize("path", ["resume", "final summary"])
+def test_time_limit_in_the_cost_write_of_an_update_keeps_each_cost(
+    tmp_path, monkeypatch, path
+):
+    run_dir = tmp_path / "run"
+    interval = UPDATE_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    # Launch 1 pays the 3 steps of its update. Then the time limit passes in
+    # the write of the cost. The launch saves the state at its end, and it
+    # stops as a stop of the process does, before the write of the cost.
+    first_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 0.1)
+        patch.setattr("shinka.database.ProgramDatabase", slow_cost_database)
+        prompts = search(
+            run_dir, first_llm, interval, 2, stop_at=("_save_bandit_state", 1)
+        )
+    # The database holds the cost of the proposals only.
+    stored = 0.01 * len(prompts)
+
+    # The state holds no update, because the database holds no cost of an
+    # update. Each program of the cut update is in the waiting list one time.
+    state = read_state(run_dir)
+    assert state["total_programs_meta_processed"] == 0
+    assert state["meta_recommendations"] is None
+    assert waiting_generations(state) == [0, 1]
+    # On a resume, the programs stay in the waiting list after the time limit.
+    # Thus the final summary of launch 1 takes them again, with the same end.
+    cut_updates = 2 if path == "resume" else 1
+    assert first_llm.batches == [[0, 1]] * cut_updates
+    assert len(first_llm.step3_messages) == cut_updates
+
+    # A resume, then a second resume.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=interval)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=interval)
+
+    # The resume makes the update again, and it writes the cost of that update.
+    assert second_llm.batches == [[0, 1]]
+    assert third_llm.batches == []
+    # The cost total of each later launch holds each update of its state one
+    # time. The total of the resume is the total at its first proposal.
+    paid_at_the_first_proposal = update_costs(second_llm.batches[: second.updates])
+    assert second.api_cost == pytest.approx(stored + paid_at_the_first_proposal)
+    assert third.api_cost == pytest.approx(stored + update_costs(second_llm.batches))
+    # The state holds each program one time, and the output file is there.
+    state = read_state(run_dir)
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert meta_files(run_dir) == ["meta_2.txt"]
+
+
+@pytest.mark.parametrize("path", UPDATE_PATHS)
+def test_failed_cost_write_of_an_update_keeps_each_cost(tmp_path, monkeypatch, path):
+    run_dir = tmp_path / "run"
+    interval = UPDATE_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    # Launch 1 pays the 3 steps of each of its updates, and each write of a
+    # cost fails. Its last update is its final summary.
+    first_llm = StubMetaLLM("launch 1")
+    generations = [] if path == "resume" else [1]
+    with monkeypatch.context() as patch:
+        fail_cost_writes(patch)
+        first = launch(run_dir, first_llm, generations, meta_rec_interval=interval)
+    assert len(first_llm.step3_messages) == len(first_llm.batches) >= 1
+
+    # The database holds no cost of an update, thus no update goes into the
+    # state: not in memory, and not in the state file.
+    assert first.first_recommendation is None
+    assert [memory["total_programs_meta_processed"] for memory in first.memory] == [
+        0 for _ in generations
+    ]
+    state = read_state(run_dir)
+    assert state["total_programs_meta_processed"] == 0
+    assert state["meta_recommendations"] is None
+    # Each program of the failed updates is in the waiting list one time.
+    assert waiting_generations(state) == [0, 1]
+
+    # A resume, then a second resume.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=interval)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=interval)
+
+    # The resume makes the update again, and it writes the cost of that update.
+    assert second_llm.batches == [[0, 1]]
+    assert third_llm.batches == []
+    # The cost total of each later launch holds each update of its state one
+    # time. The total of the resume is the total at its first proposal.
+    paid_at_the_first_proposal = update_costs(second_llm.batches[: second.updates])
+    assert second.api_cost == pytest.approx(paid_at_the_first_proposal)
+    assert third.api_cost == pytest.approx(update_costs(second_llm.batches))
+    state = read_state(run_dir)
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert meta_files(run_dir) == ["meta_2.txt"]
+
+
+def test_failed_cost_write_of_the_initial_program_update_keeps_each_cost(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    persist = ShinkaEvolveRunner._persist_program_metadata_async
+    failed_writes = []
+
+    async def fail_the_first_cost_write(runner, program):
+        if "meta_cost" in program.metadata and not failed_writes:
+            failed_writes.append(program.id)
+            raise sqlite3.OperationalError("database is locked")
+        await persist(runner, program)
+
+    # Launch 1 pays the update of the initial program, and the write of its
+    # cost fails.
+    first_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ShinkaEvolveRunner,
+            "_persist_program_metadata_async",
+            fail_the_first_cost_write,
+        )
+        first = launch(run_dir, first_llm, generations=[], meta_rec_interval=1)
+
+    # The update gives no result, and the launch continues: the search starts
+    # with the program in the waiting list, and the final summary takes it.
+    assert len(failed_writes) == 1
+    assert first.first_recommendation is None
+    assert first.start_state is None
+    assert first_llm.batches == [[0], [0]]
+    state = read_state(run_dir)
+    assert state["total_programs_meta_processed"] == 1
+    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 2."
+
+    # The setup writes the metadata of the initial program again at its end,
+    # with the cost of the failed update. Thus the database holds the cost of
+    # the 2 paid updates. The next launch finds generation 0 only: its total
+    # holds these 2 costs, and the update of its own program of generation 0.
+    second_llm = StubMetaLLM("launch 2")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=1)
+    assert second_llm.batches == [[0]]
+    assert second.api_cost == pytest.approx(
+        update_costs(first_llm.batches + second_llm.batches)
+    )
+
+
+def make_summarizer(meta_llm: StubMetaLLM) -> AsyncMetaSummarizer:
+    """Build a meta summarizer with generations 0 and 1 in its waiting list."""
+    summarizer = AsyncMetaSummarizer(MetaSummarizer(async_mode=True), meta_llm)
+    for generation in (0, 1):
+        program = make_program(f"gen-{generation}", generation, score=1.0)
+        program.code = PROGRAM.format(generation=generation)
+        program.metadata = {"patch_name": f"patch_{generation}"}
+        summarizer.add_evaluated_program(program)
+    return summarizer
+
+
+def test_update_writes_its_cost_before_its_result_goes_into_the_state():
+    summarizer = make_summarizer(StubMetaLLM("launch 1"))
+    # The cost, and the state that the summarizer holds at the write of the cost.
+    cost_writes = []
+
+    async def store_cost(meta_cost):
+        cost_writes.append(
+            (
+                meta_cost,
+                summarizer.total_programs_processed,
+                summarizer.meta_recommendations,
+                len(summarizer.evaluated_since_last_meta),
+            )
+        )
+
+    recommendations, meta_cost = asyncio.run(
+        summarizer.update_meta_memory_async(None, store_cost)
+    )
+
+    # At the write of the cost, the state is the state from before the update.
+    assert cost_writes == [(pytest.approx(0.04), 0, None, 2)]
+    assert recommendations == "1. Recommendation of launch 1 update 1."
+    assert meta_cost == pytest.approx(0.04)
+    assert summarizer.total_programs_processed == 2
+    assert summarizer.evaluated_since_last_meta == []
+
+
+def test_update_with_no_cost_makes_no_cost_write():
+    class FreeMetaLLM(StubMetaLLM):
+        async def query(self, msg, system_msg):
+            response = await super().query(msg, system_msg)
+            return StubResponse(response.content, cost=0.0)
+
+    summarizer = make_summarizer(FreeMetaLLM("launch 1"))
+    cost_writes = []
+
+    async def store_cost(meta_cost):
+        cost_writes.append(meta_cost)
+
+    recommendations, meta_cost = asyncio.run(
+        summarizer.update_meta_memory_async(None, store_cost)
+    )
+
+    assert cost_writes == []
+    assert recommendations == "1. Recommendation of launch 1 update 1."
+    assert meta_cost == 0.0
+    assert summarizer.total_programs_processed == 2
 
 
 def test_state_file_holds_each_update_before_its_output_file(tmp_path):

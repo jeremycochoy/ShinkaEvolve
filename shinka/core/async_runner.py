@@ -14,6 +14,7 @@ import math
 import psutil
 import threading
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set, Tuple, Union, Iterable
 from dataclasses import dataclass, field
@@ -700,6 +701,19 @@ class ShinkaEvolveRunner:
             (program.metadata or {}).get("meta_cost") or 0.0
             for program in self.db.get_evaluated_programs()
         )
+
+    async def _store_meta_cost(self, program: Program, meta_cost: float) -> None:
+        """Write the cost of a meta update to the database.
+
+        The cost goes to the metadata of the program that started the update.
+        The update calls this write before its result goes into the meta
+        state: after a stop, the database holds the cost of each update of
+        the state.
+        """
+        if program.metadata is None:
+            program.metadata = {}
+        program.metadata["meta_cost"] = meta_cost
+        await self._persist_program_metadata_async(program)
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
@@ -1896,7 +1910,9 @@ class ShinkaEvolveRunner:
                 (
                     updated_recs,
                     meta_cost,
-                ) = await self.meta_summarizer.update_meta_memory_async(best_program)
+                ) = await self.meta_summarizer.update_meta_memory_async(
+                    best_program, partial(self._store_meta_cost, initial_program)
+                )
                 if updated_recs:
                     # Store meta cost for tracking
                     if meta_cost > 0:
@@ -1905,14 +1921,6 @@ class ShinkaEvolveRunner:
                         )
                         # Add meta cost to in-memory total for accurate budget tracking
                         self.total_api_cost += meta_cost
-
-                        # Add meta cost to this program's metadata (the one that triggered the update)
-                        if initial_program.metadata is None:
-                            initial_program.metadata = {}
-                        initial_program.metadata["meta_cost"] = meta_cost
-                        # Write the cost before the state: after a stop, the
-                        # database holds the cost of each update of the state
-                        await self._persist_program_metadata_async(initial_program)
                     # Save meta state before the output file, so that a resume does not repeat the update
                     self._save_meta_state()
                     # Write meta output file asynchronously
@@ -4565,7 +4573,7 @@ class ShinkaEvolveRunner:
                                 updated_recs,
                                 meta_cost,
                             ) = await self.meta_summarizer.update_meta_memory_async(
-                                best_program
+                                best_program, partial(self._store_meta_cost, program)
                             )
                             if updated_recs:
                                 if meta_cost > 0:
@@ -4574,15 +4582,7 @@ class ShinkaEvolveRunner:
                                     )
                                     # Add meta cost to in-memory total for accurate budget tracking
                                     self.total_api_cost += meta_cost
-
-                                    # Add meta cost to this program's metadata
-                                    if program.metadata is None:
-                                        program.metadata = {}
-                                    program.metadata["meta_cost"] = meta_cost
                                     metadata_persist_needed = True
-                                    # Write the cost before the state: after a stop, the
-                                    # database holds the cost of each update of the state
-                                    await self._persist_program_metadata_async(program)
                                 # Save meta state before the output file, so that a resume does not repeat the update
                                 self._save_meta_state()
                                 # Write meta output file asynchronously

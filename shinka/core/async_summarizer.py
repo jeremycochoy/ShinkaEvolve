@@ -5,7 +5,8 @@ Provides non-blocking meta summarization with concurrent LLM calls.
 
 import asyncio
 import logging
-from typing import List, Optional, Tuple
+from functools import partial
+from typing import Awaitable, Callable, List, Optional, Tuple
 from pathlib import Path
 from .summarizer import MetaSummarizer
 from ..llm import AsyncLLMClient
@@ -41,12 +42,17 @@ class AsyncMetaSummarizer:
         self.async_llm_client = async_llm_client
 
     async def update_meta_memory_async(
-        self, best_program: Optional[Program] = None
+        self,
+        best_program: Optional[Program] = None,
+        store_cost: Optional[Callable[[float], Awaitable[None]]] = None,
     ) -> Tuple[Optional[str], float]:
         """
         Async version of update_meta_memory.
         Perform 3-step meta-analysis and update internal state.
         A program with no step 1 answer stays in the waiting list.
+        With store_cost, the update writes its cost before its result goes
+        into the state. A time limit, a cancel or an error in that write
+        leaves the state as it was before the update.
         Returns tuple of (updated_recommendations, total_cost) or
         (None, 0.0) if no update occurred.
         """
@@ -100,6 +106,13 @@ class AsyncMetaSummarizer:
             if not recommendations:
                 logger.error("Step 3 failed - no recommendations generated")
                 return None, total_meta_cost
+
+            # Write the cost before the result goes into the state: no save of
+            # the state then holds an update with no cost in the database. A
+            # time limit, a cancel or an error in this write leaves the state
+            # as it was, and the programs stay in the waiting list
+            if store_cost is not None and total_meta_cost > 0:
+                await store_cost(total_meta_cost)
 
             # Update internal state of sync summarizer
             # Concatenate new individual summaries to existing ones
@@ -313,10 +326,10 @@ class AsyncMetaSummarizer:
     ) -> tuple[bool, float]:
         """Async version of perform_final_summary.
 
-        The update writes its cost to the database first. With a state_path,
-        the state of the update then goes to that file, before the output
-        file. Thus after a stop between 2 writes, the database holds the cost
-        of each update of the state.
+        The update writes its cost to the database first. Then its result
+        goes into the state. With a state_path, the state then goes to that
+        file, before the output file. Thus the database holds the cost of
+        each update of the state, in memory and in the file.
 
         Returns:
             Tuple of (success, meta_cost)
@@ -335,48 +348,15 @@ class AsyncMetaSummarizer:
             f"remaining programs..."
         )
 
-        updated_recs, meta_cost = await self.update_meta_memory_async(best_program)
+        # Store the final meta cost in the best program's metadata
+        store_cost = None
+        if best_program and db_config:
+            store_cost = partial(self.store_meta_cost_async, best_program, db_config)
+        updated_recs, meta_cost = await self.update_meta_memory_async(
+            best_program, store_cost
+        )
         if updated_recs:
             logger.info(f"Final meta summary completed (cost: ${meta_cost:.4f})")
-
-            # Store the final meta cost in the best program's metadata
-            if meta_cost > 0 and best_program and db_config:
-                try:
-                    import json
-
-                    def update_metadata():
-                        from shinka.database import ProgramDatabase
-
-                        thread_db = ProgramDatabase(db_config)
-                        try:
-                            if best_program.metadata is None:
-                                best_program.metadata = {}
-
-                            # Accumulate meta_cost if it already exists
-                            existing_meta_cost = best_program.metadata.get(
-                                "meta_cost", 0.0
-                            )
-                            best_program.metadata["meta_cost"] = (
-                                existing_meta_cost + meta_cost
-                            )
-
-                            metadata_json = json.dumps(best_program.metadata)
-                            thread_db.cursor.execute(
-                                ("UPDATE programs SET metadata = ? WHERE id = ?"),
-                                (metadata_json, best_program.id),
-                            )
-                            thread_db.conn.commit()
-                        finally:
-                            thread_db.close()
-
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, update_metadata)
-                    logger.info(
-                        f"Stored final meta cost ${meta_cost:.4f} "
-                        f"in best program metadata"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to store final meta cost in database: {e}")
 
             # Save the state after the cost, and before the output file, so
             # that a resume does not repeat the update
@@ -388,6 +368,37 @@ class AsyncMetaSummarizer:
         else:
             logger.warning("Final meta summary failed to generate recommendations")
             return False, 0.0
+
+    async def store_meta_cost_async(
+        self, program: Program, db_config, meta_cost: float
+    ) -> None:
+        """Add the cost of a meta update to the metadata of a program in the database."""
+        import json
+
+        def update_metadata():
+            from shinka.database import ProgramDatabase
+
+            thread_db = ProgramDatabase(db_config)
+            try:
+                if program.metadata is None:
+                    program.metadata = {}
+
+                # Accumulate meta_cost if it already exists
+                existing_meta_cost = program.metadata.get("meta_cost", 0.0)
+                program.metadata["meta_cost"] = existing_meta_cost + meta_cost
+
+                metadata_json = json.dumps(program.metadata)
+                thread_db.cursor.execute(
+                    ("UPDATE programs SET metadata = ? WHERE id = ?"),
+                    (metadata_json, program.id),
+                )
+                thread_db.conn.commit()
+            finally:
+                thread_db.close()
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, update_metadata)
+        logger.info(f"Stored final meta cost ${meta_cost:.4f} in best program metadata")
 
     async def write_meta_output_async(self, results_dir: str) -> None:
         """Async version of write_meta_output - write files in thread pool."""
