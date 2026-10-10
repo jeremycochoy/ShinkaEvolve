@@ -1116,10 +1116,10 @@ def wandb_costs(run: FakeWandbRun) -> dict[int, dict[str, float]]:
 def retry_the_first_cost_write_after_the_wandb_log(patch, run, run_dir) -> list:
     """Make the first cost write fail, and its retry wait for the W&B log.
 
-    Thus the side effects of the program of the update end their metadata
-    write and log that program to W&B before the retry, as in the delay of 1
-    second before a retry. Returns what W&B, the database and the state file
-    hold at the retry, before its write.
+    Thus the side effects of the program of the update end before the retry:
+    the metadata write, then the W&B log. A retry delay of 1 second gives the
+    same order. Returns what W&B, the database and the state file hold at the
+    retry, before its write.
     """
     add_meta_cost = ProgramDatabase.add_meta_cost
     calls = itertools.count(1)
@@ -1202,7 +1202,7 @@ def test_cost_write_does_not_change_a_fresh_search(
     )
 
     # As on main, the state in memory takes an update after its step 3, then
-    # the output file comes, then the cost total counts the update, and the
+    # the output file comes, then the cost total counts the update. The
     # program of the update gets its cost before its W&B log. The cost write
     # comes after, in its own task. Thus a cost write that fails, or that
     # waits, changes no proposal prompt, no output file, no cost total, no W&B
@@ -1213,8 +1213,8 @@ def test_cost_write_does_not_change_a_fresh_search(
 
 
 # The paths whose meta update writes its cost to the program of the update,
-# then logs that program to W&B: the interval, the generations of the jobs,
-# and the generation of the program of the update.
+# then logs that program to W&B. Each path gives the interval, the generations
+# of the jobs, and the generation of the program of the update.
 WANDB_PATHS = {"initial program": (1, [], 0), "completed job": (2, [1], 1)}
 
 
@@ -1238,7 +1238,7 @@ def test_wandb_gets_the_cost_of_an_update_whose_cost_write_tries_again(
     expected[update_generation] = paid
     # Before the retry: as on main, W&B has the cost of the update with its
     # program. The metadata write of that program keeps the meta cost of the
-    # database, thus the database holds no cost, and no save holds the update.
+    # database. Thus the database holds no cost, and no save holds the update.
     (before,) = at_the_retry
     assert {g: costs["cost/meta"] for g, costs in before.wandb.items()} == expected
     assert before.stored == 0

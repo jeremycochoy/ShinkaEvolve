@@ -4062,9 +4062,9 @@ class ShinkaEvolveRunner:
     async def _persist_program_metadata_async(self, program: Program) -> None:
         """Persist updated program metadata using a thread-local DB handle.
 
-        The meta costs of the program stay as the database holds them: the
-        meta cost in memory of the program of a meta update is for its W&B
-        log, and the cost write of the update puts the cost into the database.
+        The meta costs of the program stay as the database holds them. The
+        program of a meta update holds the cost in memory for its W&B log.
+        Only the cost write of the update puts the cost into the database.
         """
         if not program.metadata:
             return
