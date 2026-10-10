@@ -268,8 +268,9 @@ def launch(
 
     The launch completes one job for each generation of the list. The result
     holds what the first proposal of the launch sees (the recommendation, the
-    API cost of the search, the state file, and the seconds from the last
-    progress that the runner recorded). It also holds the state file and the
+    API cost of the search, the count of the meta updates of the launch, the
+    state file, and the seconds from the last progress that the runner
+    recorded). It also holds the state file and the
     state in memory after each job, and the count of processed programs that
     the state file holds at each write of an output file.
     """
@@ -279,6 +280,7 @@ def launch(
     seen = SimpleNamespace(
         first_recommendation=None,
         api_cost=None,
+        updates=None,
         start_state=None,
         progress_age=None,
         states=[],
@@ -298,6 +300,7 @@ def launch(
     async def complete_jobs():
         try:
             seen.api_cost = runner.total_api_cost
+            seen.updates = len(meta_llm.batches) if meta_llm else 0
             seen.start_state = read_state(run_dir)
             seen.progress_age = time.time() - runner.last_progress_time
             if runner.meta_summarizer:
@@ -774,6 +777,66 @@ def test_stop_before_the_output_file_does_not_repeat_the_summary(tmp_path):
         evaluated_program_ids(run_dir)
     )
     assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (2, 2)]
+
+
+# The interval of a search of 2 generations whose first meta update is on
+# each path of the runner.
+UPDATE_PATHS = {"completed job": 2, "resume": 2, "final summary": 5}
+
+
+def update_costs(batches: list[list[int]]) -> float:
+    """Give the cost of meta updates: 0.01 for each answer of the 3 steps."""
+    return sum(0.01 * (len(batch) + 2) for batch in batches)
+
+
+@pytest.mark.parametrize("path", UPDATE_PATHS)
+@pytest.mark.parametrize("stop_before", ["save_meta_state", "write_meta_output_async"])
+def test_stop_between_the_writes_of_an_update_keeps_each_cost(
+    tmp_path, path, stop_before
+):
+    run_dir = tmp_path / "run"
+    interval = UPDATE_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    # An update writes its cost to the database, then the state, then the
+    # output file. Launch 1 pays its first update. Then it stops as a stop of
+    # the process does, before the second write or before the third write.
+    first_llm = StubMetaLLM("launch 1")
+    prompts = search(
+        run_dir, first_llm, interval, num_generations=2, stop_at=(stop_before, 1)
+    )
+    assert first_llm.batches == [[0, 1]]
+    paid = 0.01 * len(prompts) + update_costs(first_llm.batches)
+    state_holds_the_update = stop_before == "write_meta_output_async"
+    assert (read_state(run_dir) is not None) == state_holds_the_update
+    assert not (run_dir / "meta").exists()
+
+    # A resume, then a second resume.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=interval)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=interval)
+
+    if state_holds_the_update:
+        # The resume does not make the update again.
+        assert second_llm.batches == []
+    else:
+        # The state does not hold the update, thus the resume makes it again:
+        # the search paid 2 updates.
+        assert second_llm.batches == [[0, 1]]
+    assert third_llm.batches == []
+    # The cost total of each later launch holds each paid update one time.
+    # The total of the resume is the total at its first proposal.
+    paid_at_the_first_proposal = update_costs(second_llm.batches[: second.updates])
+    assert second.api_cost == pytest.approx(paid + paid_at_the_first_proposal)
+    paid += update_costs(second_llm.batches)
+    assert third.api_cost == pytest.approx(paid)
+    # The state holds each program one time, and the output file is there.
+    state = read_state(run_dir)
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert meta_files(run_dir) == ["meta_2.txt"]
 
 
 def test_state_file_holds_each_update_before_its_output_file(tmp_path):

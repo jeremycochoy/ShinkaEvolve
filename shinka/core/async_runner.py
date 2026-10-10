@@ -4543,12 +4543,6 @@ class ShinkaEvolveRunner:
                                 best_program
                             )
                             if updated_recs:
-                                # Save meta state first, so that a resume does not repeat the update
-                                self._save_meta_state()
-                                # Write meta output file asynchronously
-                                await self.meta_summarizer.write_meta_output_async(
-                                    str(self.results_dir)
-                                )
                                 if meta_cost > 0:
                                     logger.info(
                                         f"Meta recommendation cost: ${meta_cost:.4f}"
@@ -4561,6 +4555,15 @@ class ShinkaEvolveRunner:
                                         program.metadata = {}
                                     program.metadata["meta_cost"] = meta_cost
                                     metadata_persist_needed = True
+                                    # Write the cost before the state: after a stop, the
+                                    # database holds the cost of each update of the state
+                                    await self._persist_program_metadata_async(program)
+                                # Save meta state before the output file, so that a resume does not repeat the update
+                                self._save_meta_state()
+                                # Write meta output file asynchronously
+                                await self.meta_summarizer.write_meta_output_async(
+                                    str(self.results_dir)
+                                )
                 except Exception as e:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")
                     # Don't fail the whole job for meta summarizer issues

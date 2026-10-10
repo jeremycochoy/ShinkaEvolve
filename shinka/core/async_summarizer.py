@@ -313,8 +313,10 @@ class AsyncMetaSummarizer:
     ) -> tuple[bool, float]:
         """Async version of perform_final_summary.
 
-        With a state_path, the state of the update goes to that file before
-        the output file.
+        The update writes its cost to the database first. With a state_path,
+        the state of the update then goes to that file, before the output
+        file. Thus after a stop between 2 writes, the database holds the cost
+        of each update of the state.
 
         Returns:
             Tuple of (success, meta_cost)
@@ -335,10 +337,6 @@ class AsyncMetaSummarizer:
 
         updated_recs, meta_cost = await self.update_meta_memory_async(best_program)
         if updated_recs:
-            # Save the state first, so that a resume does not repeat the update
-            if state_path:
-                self.save_meta_state(state_path)
-            await self.write_meta_output_async(results_dir)
             logger.info(f"Final meta summary completed (cost: ${meta_cost:.4f})")
 
             # Store the final meta cost in the best program's metadata
@@ -379,6 +377,12 @@ class AsyncMetaSummarizer:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to store final meta cost in database: {e}")
+
+            # Save the state after the cost, and before the output file, so
+            # that a resume does not repeat the update
+            if state_path:
+                self.save_meta_state(state_path)
+            await self.write_meta_output_async(results_dir)
 
             return True, meta_cost
         else:
