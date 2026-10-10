@@ -43,6 +43,13 @@ All notable changes to `shinka-evolve` are documented in this file.
   gave the later summaries the identifier of another program, and its program
   got no summary. A program with a missing or blank answer now waits for the
   next update.
+- Fixed the async runner so a new job with the identifier of a stored job gets
+  its own row. The identifier of a local job holds the PID of its process, and
+  the system can give that PID to a new process, for example after a resume.
+  The duplicate check of an insert, the set of the inserts in flight and the
+  row lookup now use the job identifier and the generation. Before, the new
+  program got no row, and the stored program got its side effects and its meta
+  summary a second time.
 - Fixed Azure OpenAI LLM client construction to use the v1 base URL contract,
   avoiding doubled `/openai/v1/openai` request paths and 404 responses reported
   in issue #147.

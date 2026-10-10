@@ -4352,7 +4352,7 @@ class ShinkaEvolveRunner:
                     if hasattr(self.async_db, "get_program_by_source_job_id_async"):
                         existing_program = (
                             await self.async_db.get_program_by_source_job_id_async(
-                                source_job_id
+                                source_job_id, job.generation
                             )
                         )
 

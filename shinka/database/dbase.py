@@ -742,8 +742,15 @@ class ProgramDatabase:
         return (self.cursor.fetchone() or {"COUNT(*)": 0})["COUNT(*)"]
 
     @db_retry()
-    def has_program_with_source_job_id(self, source_job_id: str) -> bool:
-        """Return True if a program row already exists for the given job id."""
+    def has_program_with_source_job_id(
+        self, source_job_id: str, generation: int
+    ) -> bool:
+        """Return True if a program row already exists for the given job.
+
+        The system can give the PID of an ended local job to a new job. Thus a
+        row is the same job only when its job id and its generation are the
+        same.
+        """
         if not self.cursor:
             return False
         self.cursor.execute(
@@ -752,15 +759,21 @@ class ProgramDatabase:
             FROM programs
             WHERE json_valid(metadata)
               AND json_extract(metadata, '$.source_job_id') = ?
+              AND generation = ?
             LIMIT 1
             """,
-            (source_job_id,),
+            (source_job_id, generation),
         )
         return self.cursor.fetchone() is not None
 
     @db_retry()
-    def get_program_by_source_job_id(self, source_job_id: str) -> Optional[Program]:
-        """Return the persisted program row for a completed scheduler job."""
+    def get_program_by_source_job_id(
+        self, source_job_id: str, generation: int
+    ) -> Optional[Program]:
+        """Return the persisted program row for a completed scheduler job.
+
+        The row has the job id and the generation of the job.
+        """
         if not self.cursor:
             return None
         self.cursor.execute(
@@ -769,9 +782,10 @@ class ProgramDatabase:
             FROM programs
             WHERE json_valid(metadata)
               AND json_extract(metadata, '$.source_job_id') = ?
+              AND generation = ?
             LIMIT 1
             """,
-            (source_job_id,),
+            (source_job_id, generation),
         )
         row = self.cursor.fetchone()
         return self._program_from_row(row) if row else None

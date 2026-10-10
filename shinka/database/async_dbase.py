@@ -100,7 +100,8 @@ class AsyncProgramDatabase:
         self.write_executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = asyncio.Lock()
         self._source_job_id_lock = threading.Lock()
-        self._in_flight_source_job_ids: set[str] = set()
+        # The (job id, generation) of each insert in flight
+        self._in_flight_source_jobs: set[tuple[str, int]] = set()
         # Semaphore to limit concurrent database operations and prevent deadlocks
         # With WAL mode enabled, we can handle more concurrent operations safely
         concurrent_ops = min(
@@ -604,18 +605,23 @@ class AsyncProgramDatabase:
                 source_job_id_registered = False
                 if isinstance(program.metadata, dict):
                     source_job_id = program.metadata.get("source_job_id")
+                # A row is the same job only when its job id and its
+                # generation are the same: the system can give the PID of an
+                # ended local job to a new job
+                source_job = (source_job_id, program.generation)
                 if isinstance(source_job_id, str) and source_job_id:
                     with self._source_job_id_lock:
                         if (
-                            source_job_id in self._in_flight_source_job_ids
-                            or thread_db.has_program_with_source_job_id(source_job_id)
+                            source_job in self._in_flight_source_jobs
+                            or thread_db.has_program_with_source_job_id(*source_job)
                         ):
                             logger.info(
-                                "Skipping duplicate persisted job for source_job_id=%s",
-                                source_job_id,
+                                "Skipping duplicate persisted job for "
+                                "source_job_id=%s, generation=%s",
+                                *source_job,
                             )
                             return False
-                        self._in_flight_source_job_ids.add(source_job_id)
+                        self._in_flight_source_jobs.add(source_job)
                         source_job_id_registered = True
 
                 # Temporarily disable expensive operations
@@ -633,7 +639,7 @@ class AsyncProgramDatabase:
                 finally:
                     if source_job_id_registered:
                         with self._source_job_id_lock:
-                            self._in_flight_source_job_ids.discard(source_job_id)
+                            self._in_flight_source_jobs.discard(source_job)
                     # Restore original methods
                     thread_db._recompute_embeddings_and_clusters = (
                         original_embedding_method
@@ -819,10 +825,17 @@ class AsyncProgramDatabase:
             logger.error(f"Error in async get_best_program: {e}")
             raise
 
-    async def has_program_with_source_job_id_async(self, source_job_id: str) -> bool:
-        """Check whether a completed job has already been persisted."""
+    async def has_program_with_source_job_id_async(
+        self, source_job_id: str, generation: int
+    ) -> bool:
+        """Check whether a completed job has already been persisted.
+
+        The job is the same only when its job id and its generation are the same.
+        """
         op_id = self._debug_track_start(
-            "has_program_with_source_job_id_async", source_job_id=source_job_id
+            "has_program_with_source_job_id_async",
+            source_job_id=source_job_id,
+            generation=generation,
         )
 
         try:
@@ -832,13 +845,15 @@ class AsyncProgramDatabase:
                 thread_db = None
                 try:
                     with self._source_job_id_lock:
-                        if source_job_id in self._in_flight_source_job_ids:
+                        if (source_job_id, generation) in self._in_flight_source_jobs:
                             return True
 
                     from .dbase import ProgramDatabase
 
                     thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
-                    return thread_db.has_program_with_source_job_id(source_job_id)
+                    return thread_db.has_program_with_source_job_id(
+                        source_job_id, generation
+                    )
                 finally:
                     if thread_db:
                         thread_db.close()
@@ -853,11 +868,16 @@ class AsyncProgramDatabase:
             raise
 
     async def get_program_by_source_job_id_async(
-        self, source_job_id: str
+        self, source_job_id: str, generation: int
     ) -> Optional[Program]:
-        """Fetch a persisted program row by completed scheduler job id."""
+        """Fetch a persisted program row by completed scheduler job id.
+
+        The row has the job id and the generation of the job.
+        """
         op_id = self._debug_track_start(
-            "get_program_by_source_job_id_async", source_job_id=source_job_id
+            "get_program_by_source_job_id_async",
+            source_job_id=source_job_id,
+            generation=generation,
         )
 
         try:
@@ -869,7 +889,9 @@ class AsyncProgramDatabase:
                     from .dbase import ProgramDatabase
 
                     thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
-                    return thread_db.get_program_by_source_job_id(source_job_id)
+                    return thread_db.get_program_by_source_job_id(
+                        source_job_id, generation
+                    )
                 finally:
                     if thread_db:
                         thread_db.close()

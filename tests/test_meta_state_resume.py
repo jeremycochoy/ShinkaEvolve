@@ -205,7 +205,8 @@ def make_runner(
     )
 
     async def get_job_results(job_id, results_dir):
-        generation = int(re.search(r"(\d+)$", str(job_id)).group(1))
+        # The results directory of a job is <run_dir>/gen_<generation>/results.
+        generation = int(Path(results_dir).parent.name[4:])
         return NAN_RESULTS if generation in nan_generations else EVAL_RESULTS
 
     initial_results = NAN_RESULTS if 0 in nan_generations else EVAL_RESULTS
@@ -341,12 +342,16 @@ def search(
     meta_rec_interval: int,
     num_generations: int,
     stop_at: tuple[str, int] | None = None,
+    job_ids: dict[int, str] | None = None,
 ) -> list[str]:
     """Run one launch with the real job monitor and the real proposal coordinator.
 
     stop_at gives a method of the runner or of its meta summarizer, and a call
     number. The launch then ends at that call as a stop of the process does:
     the call does not run, and no later step of the launch runs.
+
+    job_ids gives the identifier of the job of a generation. By default, each
+    job has its own identifier.
 
     The result is the prompt of each proposal of the launch.
     """
@@ -357,7 +362,8 @@ def search(
     runner.llm = StubProposalLLM(first_generation=last_generation + 1)
 
     async def submit_job(exec_fname, results_dir):
-        return f"job-{Path(exec_fname).parent.name}"
+        generation_dir = Path(exec_fname).parent.name
+        return (job_ids or {}).get(int(generation_dir[4:]), f"job-{generation_dir}")
 
     async def completed(jobs):
         return [False] * len(jobs)
@@ -813,6 +819,37 @@ def test_stop_before_the_output_file_does_not_repeat_the_summary(tmp_path):
         evaluated_program_ids(run_dir)
     )
     assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (2, 2)]
+
+
+def test_new_job_with_the_identifier_of_a_stored_job_gets_its_own_summary(tmp_path):
+    run_dir = tmp_path / "run"
+    # The identifier of a local job holds the PID of its process, and the
+    # system can give that PID to a new process. Here the job of generation 2
+    # gets the identifier of the job of generation 1.
+    job_ids = {1: "ProcessWithLogging(PID: 4242)", 2: "ProcessWithLogging(PID: 4242)"}
+    # Launch 1 stops after the state save of the update of generation 1, thus
+    # before the end of the side effects of the job of generation 1.
+    search(
+        run_dir,
+        StubMetaLLM("launch 1"),
+        meta_rec_interval=2,
+        num_generations=2,
+        stop_at=("write_meta_output_async", 1),
+        job_ids=job_ids,
+    )
+    assert summary_labels(read_state(run_dir)["meta_summary"]) == [(0, 0), (1, 1)]
+
+    meta_llm = StubMetaLLM("launch 2")
+    search(run_dir, meta_llm, meta_rec_interval=2, num_generations=3, job_ids=job_ids)
+
+    # The job of generation 2 is a new job: its program gets its own row and
+    # its own summary. The program of generation 1 keeps its one summary.
+    programs = evaluated_program_ids(run_dir)
+    assert sorted(programs.values()) == [0, 1, 2]
+    assert meta_llm.batches == [[2]]
+    state = read_state(run_dir)
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (2, 2)]
+    assert sorted(state["processed_program_ids"]) == sorted(programs)
 
 
 # The interval of a search of 2 generations whose first meta update is on

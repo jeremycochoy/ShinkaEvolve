@@ -145,9 +145,10 @@ class _FakeAsyncDB:
     async def has_program_with_source_job_id_async(self, source_job_id):
         return source_job_id in self.seen_source_job_ids
 
-    async def get_program_by_source_job_id_async(self, source_job_id):
+    async def get_program_by_source_job_id_async(self, source_job_id, generation):
         for program in self.programs:
-            if (program.metadata or {}).get("source_job_id") == source_job_id:
+            job_id = (program.metadata or {}).get("source_job_id")
+            if job_id == source_job_id and program.generation == generation:
                 return program
         return None
 
