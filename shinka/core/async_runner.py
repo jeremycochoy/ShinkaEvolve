@@ -1997,6 +1997,11 @@ class ShinkaEvolveRunner:
                         # Add meta cost to in-memory total for accurate budget tracking
                         self.total_api_cost += meta_cost
 
+                        # Add meta cost to this program's metadata (the one that triggered the update)
+                        if initial_program.metadata is None:
+                            initial_program.metadata = {}
+                        initial_program.metadata["meta_cost"] = meta_cost
+
         # Set baseline score for LLM selection
         if self.llm_selection is not None:
             self.llm_selection.set_baseline_score(
@@ -4055,7 +4060,12 @@ class ShinkaEvolveRunner:
         return await get_code_embedding_async(exec_fname, self.embedding_client)
 
     async def _persist_program_metadata_async(self, program: Program) -> None:
-        """Persist updated program metadata using a thread-local DB handle."""
+        """Persist updated program metadata using a thread-local DB handle.
+
+        The meta costs of the program stay as the database holds them: the
+        meta cost in memory of the program of a meta update is for its W&B
+        log, and the cost write of the update puts the cost into the database.
+        """
         if not program.metadata:
             return
 
@@ -4070,12 +4080,7 @@ class ShinkaEvolveRunner:
 
             thread_db = ProgramDatabase(self.db.config)
             try:
-                metadata_json = json.dumps(program.metadata)
-                thread_db.cursor.execute(
-                    "UPDATE programs SET metadata = ? WHERE id = ?",
-                    (metadata_json, program.id),
-                )
-                thread_db.conn.commit()
+                thread_db.update_program_metadata(program.id, program.metadata)
             finally:
                 thread_db.close()
 
@@ -4653,6 +4658,11 @@ class ShinkaEvolveRunner:
                                     )
                                     # Add meta cost to in-memory total for accurate budget tracking
                                     self.total_api_cost += meta_cost
+
+                                    # Add meta cost to this program's metadata
+                                    if program.metadata is None:
+                                        program.metadata = {}
+                                    program.metadata["meta_cost"] = meta_cost
                                     metadata_persist_needed = True
                 except Exception as e:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")

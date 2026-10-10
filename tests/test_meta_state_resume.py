@@ -15,12 +15,14 @@ import logging
 import math
 import re
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -42,6 +44,7 @@ from shinka.prompts import (
     META_STEP2_SYSTEM_MSG,
     META_STEP3_SYSTEM_MSG,
 )
+from shinka.wandb_logging import PROGRAM_TABLE_KEY, ShinkaWandbLogger
 
 STATE_FILE = "meta_memory.json"
 EVAL_RESULTS = {
@@ -1050,6 +1053,96 @@ def hold_cost_writes_until_the_final_summary(patch) -> None:
     )
 
 
+class FakeWandbRun:
+    """Take the place of a W&B run, and record what the runner logs to it."""
+
+    def __init__(self):
+        self.payloads: list[dict] = []
+        self.summary: dict = {}
+        self.logged = threading.Condition()
+
+    def define_metric(self, *args, **kwargs):
+        pass
+
+    def log(self, payload: dict) -> None:
+        with self.logged:
+            self.payloads.append(payload)
+            self.logged.notify_all()
+
+    def finish(self):
+        pass
+
+    def program_payloads(self) -> list[dict]:
+        """Give the payload of each program that the runner logged."""
+        return [payload for payload in self.payloads if "individual/id" in payload]
+
+    def wait_for_the_log_of(self, program_id: str) -> None:
+        """Wait in a worker thread until the runner logs a program."""
+        with self.logged:
+            assert self.logged.wait_for(
+                lambda: any(
+                    payload["individual/id"] == program_id
+                    for payload in self.program_payloads()
+                ),
+                timeout=30,
+            )
+
+
+def record_wandb(patch) -> FakeWandbRun:
+    """Turn on the W&B logging of each runner, with a fake wandb package."""
+    run = FakeWandbRun()
+    wandb: Any = ModuleType("wandb")
+    wandb.init = lambda **kwargs: run
+    wandb.Table = SimpleNamespace
+    patch.setitem(sys.modules, "wandb", wandb)
+    patch.setattr(
+        async_runner, "ShinkaWandbLogger", lambda enabled: ShinkaWandbLogger(True)
+    )
+    return run
+
+
+def wandb_costs(run: FakeWandbRun) -> dict[int, dict[str, float]]:
+    """Give the costs of the W&B payload of each program, by generation."""
+    return {
+        payload["generation"]: {
+            key: round(value, 6)
+            for key, value in payload.items()
+            if key.startswith("cost/")
+        }
+        for payload in run.program_payloads()
+    }
+
+
+def retry_the_first_cost_write_after_the_wandb_log(patch, run, run_dir) -> list:
+    """Make the first cost write fail, and its retry wait for the W&B log.
+
+    Thus the side effects of the program of the update end their metadata
+    write and log that program to W&B before the retry, as in the delay of 1
+    second before a retry. Returns what W&B, the database and the state file
+    hold at the retry, before its write.
+    """
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    calls = itertools.count(1)
+    at_the_retry: list[SimpleNamespace] = []
+
+    def fail_then_write_after_the_log(db, program_id, *args):
+        if next(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        if not at_the_retry:
+            run.wait_for_the_log_of(program_id)
+            at_the_retry.append(
+                SimpleNamespace(
+                    wandb=wandb_costs(run),
+                    stored=stored_meta_costs(run_dir),
+                    state=read_state(run_dir),
+                )
+            )
+        return add_meta_cost(db, program_id, *args)
+
+    patch.setattr(ProgramDatabase, "add_meta_cost", fail_then_write_after_the_log)
+    return at_the_retry
+
+
 # The failure points of the cost write of a meta update.
 COST_WRITE_FAILURES = {
     "fails 1 time": partial(fail_the_first_cost_writes, count=1),
@@ -1070,12 +1163,13 @@ def fresh_search_result(run_dir, monkeypatch, interval, max_api_costs, failure=N
     """Run a fresh search of 3 generations, with the failure point of a cost write.
 
     Return what the search gives: the programs of each meta update, the meta
-    marks of each proposal prompt, the output files and the cost total at
-    the end of the search.
+    marks of each proposal prompt, the output files, the cost total at the
+    end of the search, and the costs of the W&B payload of each program.
     """
     meta_llm = StubMetaLLM("launch 1")
     totals: list[float] = []
     with monkeypatch.context() as patch:
+        run = record_wandb(patch)
         if failure:
             COST_WRITE_FAILURES[failure](patch)
         prompts = search(
@@ -1086,6 +1180,7 @@ def fresh_search_result(run_dir, monkeypatch, interval, max_api_costs, failure=N
         "prompts": prompt_marks(prompts),
         "output files": output_texts(run_dir),
         "cost total": round(totals[-1], 6),
+        "W&B costs": wandb_costs(run),
     }
 
 
@@ -1107,13 +1202,65 @@ def test_cost_write_does_not_change_a_fresh_search(
     )
 
     # As on main, the state in memory takes an update after its step 3, then
-    # the output file comes, then the cost total counts the update. The cost
-    # write comes after, in its own task. Thus a cost write that fails, or
-    # that waits, changes no proposal prompt, no output file, no cost total,
-    # and no stop of the cost budget (0.045 stops the search after its first
-    # update at the intervals 1 and 2).
+    # the output file comes, then the cost total counts the update, and the
+    # program of the update gets its cost before its W&B log. The cost write
+    # comes after, in its own task. Thus a cost write that fails, or that
+    # waits, changes no proposal prompt, no output file, no cost total, no W&B
+    # payload of a program, and no stop of the cost budget (0.045 stops the
+    # search after its first update at the intervals 1 and 2).
     assert result == REFERENCE_SEARCHES[key]
     assert result["updates"]
+
+
+# The paths whose meta update writes its cost to the program of the update,
+# then logs that program to W&B: the interval, the generations of the jobs,
+# and the generation of the program of the update.
+WANDB_PATHS = {"initial program": (1, [], 0), "completed job": (2, [1], 1)}
+
+
+@pytest.mark.parametrize("path", WANDB_PATHS)
+def test_wandb_gets_the_cost_of_an_update_whose_cost_write_tries_again(
+    tmp_path, monkeypatch, path
+):
+    run_dir = tmp_path / "run"
+    interval, generations, update_generation = WANDB_PATHS[path]
+    meta_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        run = record_wandb(patch)
+        at_the_retry = retry_the_first_cost_write_after_the_wandb_log(
+            patch, run, run_dir
+        )
+        result = launch(run_dir, meta_llm, generations, meta_rec_interval=interval)
+
+    assert len(meta_llm.batches) == 1
+    paid = round(update_costs(meta_llm.batches), 6)
+    expected = {generation: 0.0 for generation in [0, *generations]}
+    expected[update_generation] = paid
+    # Before the retry: as on main, W&B has the cost of the update with its
+    # program. The metadata write of that program keeps the meta cost of the
+    # database, thus the database holds no cost, and no save holds the update.
+    (before,) = at_the_retry
+    assert {g: costs["cost/meta"] for g, costs in before.wandb.items()} == expected
+    assert before.stored == 0
+    assert before.state is None or before.state["meta_recommendations_history"] == []
+    # After the retry: W&B logged each program one time, with the same cost.
+    # The database holds the cost one time, and the state file holds the
+    # update.
+    assert {g: costs["cost/meta"] for g, costs in wandb_costs(run).items()} == expected
+    assert len(run.program_payloads()) == len(expected)
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    assert len(stored_update_ids(run_dir)) == 1
+    state = read_state(run_dir)
+    assert state["meta_recommendations_history"] == [
+        "1. Recommendation of launch 1 update 1."
+    ]
+    assert waiting_generations(state) == []
+    # The final table and the summary of W&B read the database and the cost
+    # total: each holds the cost one time.
+    table = run.payloads[-1][PROGRAM_TABLE_KEY]
+    assert sum(row[-1] for row in table.data) == pytest.approx(paid)
+    assert run.summary["run/total_api_cost"] == pytest.approx(paid)
+    assert result.final_api_cost == pytest.approx(paid)
 
 
 def make_meta_program(generation: int) -> Program:
@@ -1923,6 +2070,37 @@ def test_full_metadata_write_keeps_the_meta_costs_of_the_database(tmp_path):
     asyncio.run(update_metadata(db, "gen-2", {"patch_name": "patch_2"}))
     assert db.get("gen-2").metadata == {"patch_name": "patch_2"}
     db.close()
+
+
+def test_metadata_write_of_the_runner_keeps_the_meta_costs_of_the_database(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    meta_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        # With no metadata write in the async database, the runner writes the
+        # full metadata of a program itself.
+        patch.delattr(AsyncProgramDatabase, "update_program_metadata_async")
+        fail_cost_writes(patch)
+        run = record_wandb(patch)
+        launch(run_dir, meta_llm, [1], meta_rec_interval=2)
+
+    # As on main, the program of the update holds the cost of the update, thus
+    # W&B gets it. Each cost write fails: the metadata write of that program
+    # puts no meta cost into the database, and no save holds the update.
+    paid = round(update_costs(meta_llm.batches), 6)
+    assert wandb_costs(run)[1]["cost/meta"] == paid
+    config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
+    db = ProgramDatabase(config=config, embedding_model="", read_only=True)
+    try:
+        (program,) = [p for p in db.get_evaluated_programs() if p.generation == 1]
+    finally:
+        db.close()
+    assert program.metadata["postprocess_side_effects_applied"]
+    assert stored_meta_costs(run_dir) == 0
+    state = read_state(run_dir)
+    assert state["meta_recommendations_history"] == []
+    assert sorted(waiting_generations(state)) == [0, 1]
 
 
 async def update_metadata(db: ProgramDatabase, program_id: str, metadata: dict):
