@@ -796,15 +796,29 @@ class ShinkaEvolveRunner:
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
 
-        The time limit or an error does not stop the resume: the search starts.
+        The final summary needs a best program. Thus with no generation left
+        and no best program, no later update comes in the launch, and the
+        update runs whatever the interval. The time limit or an error does not
+        stop the resume: the search starts.
         """
-        if self.meta_summarizer is None or not self.meta_summarizer.should_update_meta(
-            self.evo_config.meta_rec_interval
+        if (
+            self.meta_summarizer is None
+            or not self.meta_summarizer.evaluated_since_last_meta
         ):
             return
-        logger.info("Updating meta memory before the first proposal of the resume...")
         try:
             best_program = await self.async_db.get_best_program_async()
+            no_later_update = (
+                best_program is None
+                and self.completed_generations >= self.evo_config.num_generations
+            )
+            if not no_later_update and not self.meta_summarizer.should_update_meta(
+                self.evo_config.meta_rec_interval
+            ):
+                return
+            logger.info(
+                "Updating meta memory before the first proposal of the resume..."
+            )
             # The update writes its cost to the best program. With no correct
             # program, the update runs as the update of a completed job does,
             # and it writes its cost to a waiting program of the database
@@ -1424,10 +1438,10 @@ class ShinkaEvolveRunner:
             logger.info("=" * 80)
             self._load_bandit_state()
             await self._load_meta_state()
-            await self._summarize_waiting_programs()
 
             # Update state for resuming
             await self._restore_resume_progress()
+            await self._summarize_waiting_programs()
         else:
             # A database with generation 0 only is not a resume: the launch
             # evaluates the initial program again, and its cost total starts

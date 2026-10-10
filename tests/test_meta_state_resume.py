@@ -369,6 +369,7 @@ def search(
     stop_at: tuple[str, int] | None = None,
     job_ids: dict[int, str] | None = None,
     totals: list[float] | None = None,
+    nan_generations=(),
 ) -> list[str]:
     """Run one launch with the real job monitor and the real proposal coordinator.
 
@@ -382,9 +383,17 @@ def search(
     totals gets the API cost of the search at each proposal, then at the end
     of the launch.
 
+    The evaluation of each generation of nan_generations gives a NaN score.
+
     The result is the prompt of each proposal of the launch.
     """
-    runner = make_runner(run_dir, meta_llm, meta_rec_interval, num_generations)
+    runner = make_runner(
+        run_dir,
+        meta_llm,
+        meta_rec_interval,
+        num_generations,
+        nan_generations=nan_generations,
+    )
     last_generation = max(
         (int(path.name[4:]) for path in run_dir.glob("gen_*")), default=0
     )
@@ -2202,6 +2211,66 @@ def test_resume_with_no_correct_program_makes_the_due_update(
     assert [
         identifier for _, identifier in summary_labels(state["meta_summary"])
     ] == list(range(num_generations))
+
+
+def test_resume_with_no_generation_left_and_no_best_program_makes_the_update(
+    tmp_path, caplog
+):
+    run_dir = tmp_path / "run"
+    # An older results directory: 3 programs that are not correct, and no
+    # state file. Thus the database has no best program.
+    launch(run_dir, None, generations=[1, 2], nan_generations={0, 1, 2})
+    assert read_state(run_dir) is None
+
+    # A resume with no generation left, and fewer waiting programs than the
+    # interval. Then a second resume and a third resume.
+    llms = [StubMetaLLM(f"launch {number}") for number in (1, 2, 3)]
+    totals: list[list[float]] = [[], [], []]
+    for meta_llm, launch_totals in zip(llms, totals):
+        assert search(run_dir, meta_llm, 5, 3, totals=launch_totals) == []
+
+    # With no best program, no final summary comes. Thus the first resume
+    # summarizes the 3 programs whatever the interval, and it writes the cost
+    # to a waiting program. The later resumes make no update.
+    assert [meta_llm.batches for meta_llm in llms] == [[[0, 1, 2]], [], []]
+    paid = update_costs(llms[0].batches)
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    assert totals == [[pytest.approx(paid)]] * 3
+    state = read_state(run_dir)
+    assert waiting_generations(state) == []
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (2, 2)]
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert meta_files(run_dir) == ["meta_3.txt"]
+    # No launch logs an error.
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_fresh_search_with_no_best_program_leaves_the_update_to_the_resume(
+    tmp_path,
+):
+    run_dir = tmp_path / "run"
+    # A fresh search of 3 programs that are not correct, below the interval.
+    first_llm = StubMetaLLM("launch 1")
+    search(run_dir, first_llm, 5, 3, nan_generations={0, 1, 2})
+
+    # As on main, the final summary needs a best program: the 3 programs wait.
+    assert first_llm.batches == []
+    assert len(read_state(run_dir)["unprocessed_programs"]) == 3
+    assert not (run_dir / "meta").exists()
+
+    # The resume has no generation left, thus it summarizes them.
+    second_llm = StubMetaLLM("launch 2")
+    search(run_dir, second_llm, 5, 3, nan_generations={0, 1, 2})
+    assert len(second_llm.batches) == 1
+    assert len(second_llm.batches[0]) == 3
+    state = read_state(run_dir)
+    assert waiting_generations(state) == []
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert meta_files(run_dir) == ["meta_3.txt"]
 
 
 def test_resume_starts_when_its_update_gives_an_error(tmp_path, monkeypatch):
