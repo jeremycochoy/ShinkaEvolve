@@ -1153,6 +1153,52 @@ def test_cost_write_that_commits_after_the_time_limit_keeps_the_output_file(
     assert meta_files(run_dir) == ["meta_2.txt"]
 
 
+@pytest.mark.parametrize("cost_write", ["fails each try", "is slow, then fails"])
+def test_final_summary_with_no_cost_in_the_database_keeps_the_output_file(
+    tmp_path, monkeypatch, cost_write
+):
+    run_dir = tmp_path / "run"
+    # A fresh search of 2 correct programs. The cost of its final summary does
+    # not get into the database: each try of the write fails, or the time
+    # limit cuts a slow write that then fails.
+    meta_llm = StubMetaLLM("launch 1")
+    totals: list[float] = []
+    with monkeypatch.context() as patch:
+        if cost_write == "fails each try":
+            fail_cost_writes(patch)
+        else:
+            patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 0.1)
+            patch.setattr(ProgramDatabase, "add_meta_cost", slow_cost_write)
+        prompts = search(run_dir, meta_llm, 5, 2, totals=totals)
+
+    # The state file does not take the update, and the cost total does not
+    # count it. As on main, the output file holds the update.
+    assert meta_llm.batches == [[0, 1]]
+    assert stored_meta_costs(run_dir) == 0
+    stored = 0.01 * len(prompts)
+    assert totals[-1] == pytest.approx(stored)
+    state = read_state(run_dir)
+    assert state["meta_recommendations"] is None
+    assert waiting_generations(state) == [0, 1]
+    assert meta_files(run_dir) == ["meta_2.txt"]
+    output = (run_dir / "meta" / "meta_2.txt").read_text(encoding="utf-8")
+    assert "1. Recommendation of launch 1 update 1." in output
+    assert summary_labels(output) == [(0, 0), (1, 1)]
+
+    # A resume, then a second resume. The resume makes the update again, and
+    # its output file takes the place of the first one.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=5)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=5)
+    assert second_llm.batches == [[0, 1]]
+    assert third_llm.batches == []
+    assert second.api_cost == pytest.approx(stored)
+    assert third.api_cost == pytest.approx(stored + update_costs(second_llm.batches))
+    assert meta_files(run_dir) == ["meta_2.txt"]
+    output = (run_dir / "meta" / "meta_2.txt").read_text(encoding="utf-8")
+    assert "1. Recommendation of launch 2 update 1." in output
+
+
 @pytest.mark.parametrize("path", ["resume", "final summary"])
 def test_failed_cost_write_of_an_update_keeps_each_cost(tmp_path, monkeypatch, path):
     run_dir = tmp_path / "run"

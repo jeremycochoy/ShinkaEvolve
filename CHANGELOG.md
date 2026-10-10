@@ -48,10 +48,11 @@ All notable changes to `shinka-evolve` are documented in this file.
   setup: the runner logs it and continues with the saved state. At the end of
   a launch, after the wait for the database writers, a pending update whose
   cost write committed after its time limit goes into the state, the cost
-  total and the output file. A resume with no correct program also makes the
-  update that is due, and writes its cost to a waiting program. With no
-  generation left, that update runs whatever the interval, because the final
-  summary needs a correct program.
+  total and the output file. A pending update with no cost in the database
+  goes into the output file only, as on `main`. A resume with no correct
+  program also makes the update that is due, and writes its cost to a waiting
+  program. With no generation left, that update runs whatever the interval,
+  because the final summary needs a correct program.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

@@ -777,19 +777,26 @@ class ShinkaEvolveRunner:
             await self._write_meta_output()
 
     async def _take_late_meta_update(self) -> None:
-        """Put the pending meta update into the state when its cost committed late.
+        """Write the pending meta update at the end of the launch.
 
         A time limit cuts a cost write in the event loop only: its worker
         thread can commit after the time limit. The cleanup of the launch
         waits for the writers of the database. Thus after the cleanup, the
-        database holds the cost of such a write. An error does not stop the
-        end of the launch.
+        database can hold the cost of the pending update: then the state takes
+        it. Else the output file holds the update, as on main, but the state
+        file does not, and a later launch makes the update again. An error
+        does not stop the end of the launch.
         """
         if self.meta_summarizer is None or self.meta_summarizer.pending_update is None:
             return
         try:
             for program in self.db.get_all_programs():
                 await self._take_stored_meta_update(program)
+            update = self.meta_summarizer.pending_update
+            if update is not None:
+                # The state file does not get the update: no save comes after
+                self.meta_summarizer.take_stored_update(update)
+                await self._write_meta_output()
         except Exception as e:
             logger.error(f"❌ Error in the late take of the pending meta update: {e}")
 
