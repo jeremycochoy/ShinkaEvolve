@@ -31,11 +31,13 @@ All notable changes to `shinka-evolve` are documented in this file.
   after each meta update and at the end of a run. A launch on a database with
   an evaluated program loads that file, and adds each evaluated program of the
   database that the state does not hold. A resume then makes the meta update
-  that is due before the first new proposal. A meta update writes its cost to
-  the database before its result goes into the state, so the cost total of a
-  later launch holds the cost of each update of the state. When that write
-  fails, or when the time limit of the update passes in it, the update gives
-  no result and its programs wait for the next update.
+  that is due before the first new proposal. A meta update adds its cost to
+  the value in the database before its result goes into the state. The add
+  reads and writes in one transaction, so a late cost write never replaces
+  another one, and the cost total of a later launch holds the cost of each
+  update of the state. When that write fails, or when the time limit of the
+  update passes in it, the update gives no result and its programs wait for
+  the next update.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

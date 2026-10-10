@@ -708,12 +708,12 @@ class ShinkaEvolveRunner:
         The cost goes to the metadata of the program that started the update.
         The update calls this write before its result goes into the meta
         state: after a stop, the database holds the cost of each update of
-        the state.
+        the state. The write adds the cost in the database, as the update of
+        a resume and the final summary do.
         """
-        if program.metadata is None:
-            program.metadata = {}
-        program.metadata["meta_cost"] = meta_cost
-        await self._persist_program_metadata_async(program)
+        await self.meta_summarizer.store_meta_cost_async(
+            program, self.db.config, meta_cost
+        )
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.

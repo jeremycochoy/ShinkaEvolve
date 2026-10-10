@@ -1680,6 +1680,41 @@ class ProgramDatabase:
         ]
         return sorted(programs, key=lambda p: (p.generation, p.timestamp))
 
+    def add_meta_cost(self, program_id: str, meta_cost: float) -> Optional[float]:
+        """Add the cost of a meta update to the metadata of a program.
+
+        The read and the write of the metadata are in one IMMEDIATE
+        transaction. It holds the write lock of the database from the read to
+        the commit, thus no other write comes between them, and a cost write
+        never loses an other cost write. A missing cost counts as 0, and each
+        other field of the metadata stays as it is. Returns the new meta cost
+        of the program, or None when the database does not hold the program.
+        """
+        if not self.cursor or not self.conn:
+            raise ConnectionError("DB not connected.")
+        # The JSON functions of SQLite do not read the NaN of Python, thus
+        # Python reads and writes the metadata
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.cursor.execute(
+                "SELECT metadata FROM programs WHERE id = ?", (program_id,)
+            )
+            row = self.cursor.fetchone()
+            if row is None:
+                return None
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
+            self.cursor.execute(
+                "UPDATE programs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), program_id),
+            )
+            self.conn.commit()
+            return metadata["meta_cost"]
+        finally:
+            # Release the write lock when the add stops before its commit
+            if self.conn.in_transaction:
+                self.conn.rollback()
+
     @db_retry()
     def get_programs_summary(self) -> List[Dict[str, Any]]:
         """
