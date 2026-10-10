@@ -651,18 +651,32 @@ class ShinkaEvolveRunner:
     async def _load_meta_state(self) -> None:
         """Load the meta summarizer state from disk, and complete it.
 
-        A stop can come before the save of the state, or before the write of
-        an output file. Thus the load puts each evaluated program of the
-        database that the state does not hold into the waiting list. It also
-        writes the output file of the last update again when it is missing. A
-        run directory with no state file has an empty state. An error does not
-        stop the resume.
+        The meta state follows the database: the load does nothing when the
+        database holds no evaluated program. A stop can come before the save
+        of the state, or before the write of an output file. Thus the load
+        puts each evaluated program of the database that the state does not
+        hold into the waiting list. It also writes the output file of the last
+        update again when it is missing. A run directory with no state file
+        has an empty state. An error does not stop the launch.
         """
         if self.meta_summarizer is None:
             return
         try:
-            self.meta_summarizer.load_meta_state(self._meta_state_path())
-            self.meta_summarizer.add_unknown_programs(self.db.get_evaluated_programs())
+            evaluated_programs = self.db.get_evaluated_programs()
+            if not evaluated_programs:
+                return
+            loaded = self.meta_summarizer.load_meta_state(self._meta_state_path())
+            waiting_in_state = len(self.meta_summarizer.evaluated_since_last_meta)
+            self.meta_summarizer.add_unknown_programs(evaluated_programs)
+            waiting = len(self.meta_summarizer.evaluated_since_last_meta)
+            logger.info(
+                f"Meta state of the launch: "
+                f"state file {'loaded' if loaded else 'not loaded'}, "
+                f"{self.meta_summarizer.total_programs_processed} processed programs, "
+                f"{waiting} waiting programs "
+                f"({waiting - waiting_in_state} from the database), recommendations: "
+                f"{'Yes' if self.meta_summarizer.meta_recommendations else 'No'}"
+            )
             for program in self.meta_summarizer.evaluated_since_last_meta:
                 # A fresh search gives the summary a bool and a float. SQLite
                 # gives 0 or 1, and SQLite and the state file give no value
@@ -1306,6 +1320,11 @@ class ShinkaEvolveRunner:
             # Update state for resuming
             await self._restore_resume_progress()
         else:
+            # A database with generation 0 only is not a resume: the launch
+            # evaluates the initial program again. But the meta state follows
+            # the database
+            await self._load_meta_state()
+
             # Generate or copy initial program only if NOT resuming
             if (
                 self.evo_config.init_program_path

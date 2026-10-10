@@ -10,6 +10,7 @@ test starts a search or calls an LLM.
 
 import asyncio
 import json
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -148,11 +149,14 @@ class StubProposalLLM:
 
     def __init__(self, first_generation: int):
         self.generation = first_generation
+        # The system message and the user message of each proposal.
+        self.prompts: list[str] = []
 
     def get_kwargs(self, model_sample_probs=None):
         return {"model_name": "stub-model"}
 
     async def query(self, msg, system_msg, **kwargs):
+        self.prompts.append(f"{system_msg}\n{msg}")
         program = PROGRAM.format(generation=self.generation)
         proposal = PROPOSAL.format(generation=self.generation, program=program)
         self.generation += 1
@@ -325,12 +329,15 @@ def search(
     meta_rec_interval: int,
     num_generations: int,
     stop_at: tuple[str, int] | None = None,
-) -> None:
+) -> list[str]:
     """Run one launch with the real job monitor and the real proposal coordinator.
 
-    stop_at gives a method of the meta summarizer and a call number. The launch
-    then ends at that call as a stop of the process does: the call does not
-    run, and the launch makes no final summary and no final save.
+    stop_at gives a method of the runner or of its meta summarizer, and a call
+    number. The launch then ends at that call as a stop of the process does:
+    the call does not run, and the launch makes no final summary and no final
+    save.
+
+    The result is the prompt of each proposal of the launch.
     """
     runner = make_runner(run_dir, meta_llm, meta_rec_interval, num_generations)
     last_generation = max(
@@ -350,7 +357,9 @@ def search(
     async def run_search():
         if stop_at:
             method_name, stop_call = stop_at
-            method = getattr(runner.meta_summarizer, method_name)
+            is_runner_method = hasattr(ShinkaEvolveRunner, method_name)
+            owner = runner if is_runner_method else runner.meta_summarizer
+            method = getattr(owner, method_name)
             launch_task = asyncio.current_task()
             calls = []
 
@@ -361,7 +370,7 @@ def search(
                     raise asyncio.CancelledError
                 return method(*args)
 
-            setattr(runner.meta_summarizer, method_name, stop_or_call)
+            setattr(owner, method_name, stop_or_call)
         await asyncio.wait_for(runner.run_async(), timeout=60)
 
     if stop_at:
@@ -369,6 +378,7 @@ def search(
             asyncio.run(run_search())
     else:
         asyncio.run(run_search())
+    return runner.llm.prompts
 
 
 def evaluated_program_ids(run_dir: Path) -> dict[str, int]:
@@ -447,6 +457,116 @@ def test_update_of_the_initial_program_writes_the_meta_state(tmp_path):
         seen.start_state["meta_recommendations"]
         == "1. Recommendation of launch 1 update 1."
     )
+
+
+def test_launch_on_generation_0_only_continues_the_meta_state(tmp_path, caplog):
+    run_dir = tmp_path / "run"
+    # Launch 1 stops as a stop of the process does, after the update of
+    # generation 0 and before the proposal of generation 1.
+    search(
+        run_dir,
+        StubMetaLLM("launch 1"),
+        meta_rec_interval=1,
+        num_generations=2,
+        stop_at=("_verify_database_ready", 1),
+    )
+    assert list(evaluated_program_ids(run_dir).values()) == [0]
+    first_output = (run_dir / "meta" / "meta_1.txt").read_text(encoding="utf-8")
+
+    meta_llm = StubMetaLLM("launch 2")
+    with caplog.at_level(logging.INFO, logger="shinka.core.async_runner"):
+        prompts = search(run_dir, meta_llm, meta_rec_interval=1, num_generations=2)
+
+    # A database with generation 0 only is not a resume: the runner evaluates
+    # the initial program again. That program is a new row, thus it gets its
+    # own summary.
+    programs = evaluated_program_ids(run_dir)
+    assert sorted(programs.values()) == [0, 0, 1]
+    assert meta_llm.batches == [[0], [1]]
+    # The launch loads the state of launch 1, and a log line says what it loaded.
+    assert (
+        "Meta state of the launch: state file loaded, 1 processed programs, "
+        "0 waiting programs (0 from the database), recommendations: Yes"
+    ) in caplog.messages
+    # The update of the new program continues the insights and the
+    # recommendations of launch 1. It comes before the first proposal, thus
+    # that proposal gets the recommendation of this update.
+    assert "Insights of launch 1 update 1." in meta_llm.step2_messages[0]
+    assert "1. Recommendation of launch 1 update 1." in meta_llm.step3_messages[0]
+    assert "Recommendation of launch 2 update 1." in prompts[0]
+    # The count of the processed programs continues, and the output file of
+    # launch 1 stays.
+    assert meta_files(run_dir) == ["meta_1.txt", "meta_2.txt", "meta_3.txt"]
+    assert (run_dir / "meta" / "meta_1.txt").read_text(encoding="utf-8") == first_output
+    state = read_state(run_dir)
+    assert sorted(state["processed_program_ids"]) == sorted(programs)
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (0, 0), (1, 1)]
+
+
+def test_first_proposal_after_generation_0_only_gets_the_saved_recommendation(tmp_path):
+    run_dir = tmp_path / "run"
+    search(
+        run_dir,
+        StubMetaLLM("launch 1"),
+        meta_rec_interval=1,
+        num_generations=2,
+        stop_at=("_verify_database_ready", 1),
+    )
+
+    # With an interval of 2, the new program of generation 0 waits for the
+    # program of generation 1: no update comes before the first proposal.
+    meta_llm = StubMetaLLM("launch 2")
+    prompts = search(run_dir, meta_llm, meta_rec_interval=2, num_generations=2)
+
+    # The first proposal prompt of launch 2 holds the recommendation of launch 1.
+    assert "Recommendation of launch 1 update 1." in prompts[0]
+    # The count continues: 1 program of launch 1, then 2 programs of launch 2.
+    assert meta_llm.batches == [[0, 1]]
+    assert meta_files(run_dir) == ["meta_1.txt", "meta_3.txt"]
+    state = read_state(run_dir)
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+
+
+def test_fresh_search_does_not_load_a_state_file_with_no_database(tmp_path):
+    run_dir = tmp_path / "run"
+    # A state file of another search, in a results directory with no database.
+    other_dir = tmp_path / "other" / "run"
+    other_dir.parent.mkdir()
+    launch(other_dir, StubMetaLLM("other search"), generations=[1, 2])
+    run_dir.mkdir()
+    (run_dir / STATE_FILE).write_bytes((other_dir / STATE_FILE).read_bytes())
+
+    meta_llm = StubMetaLLM("launch 1")
+    seen = launch(run_dir, meta_llm, generations=[1, 2])
+
+    # The meta state follows the database: the search starts with no state.
+    assert seen.first_recommendation is None
+    assert meta_llm.batches == [[0, 1, 2]]
+    assert "other search" not in meta_llm.step3_messages[0]
+    assert meta_files(run_dir) == ["meta_3.txt"]
+
+
+def test_log_line_says_what_the_launch_loaded(tmp_path, caplog):
+    run_dir = tmp_path / "run"
+    caplog.set_level(logging.INFO, logger="shinka.core.async_runner")
+    # A launch with no meta summary gives 2 programs and no state file.
+    launch(run_dir, None, generations=[1])
+    # The final summary of launch 2 gives no recommendations: generation 3
+    # waits in the state file.
+    launch(run_dir, StubMetaLLM("launch 2", failing_updates={2}), generations=[2, 3])
+    # A launch with no meta summary gives generation 4 to the database only.
+    launch(run_dir, None, generations=[4])
+    launch(run_dir, StubMetaLLM("launch 4"), generations=[])
+
+    start = "Meta state of the launch: "
+    assert [line for line in caplog.messages if line.startswith(start)] == [
+        start + "state file not loaded, 0 processed programs, "
+        "2 waiting programs (2 from the database), recommendations: No",
+        start + "state file loaded, 3 processed programs, "
+        "2 waiting programs (1 from the database), recommendations: Yes",
+    ]
 
 
 def test_resume_continues_the_meta_state(tmp_path):
