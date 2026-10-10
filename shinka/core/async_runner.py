@@ -711,12 +711,13 @@ class ShinkaEvolveRunner:
         Each meta update writes its cost with this method. The update of a
         completed job and of the initial program write to the program that
         started the update. The update of a resume and the final summary write
-        to the best program. The update calls this write before its result
-        goes into the meta state: after a stop, the database holds the cost
-        of each update of the state. The write waits in the write queue of the
-        database, and the database adds the cost to its own value in one
-        transaction, one time for each update id. When the write commits, the
-        cost total of the launch counts the cost.
+        to the best program. With no correct program, the update of a resume
+        writes to a waiting program. The update calls this write before its
+        result goes into the meta state: after a stop, the database holds the
+        cost of each update of the state. The write waits in the write queue
+        of the database, and the database adds the cost to its own value in
+        one transaction, one time for each update id. When the write commits,
+        the cost total of the launch counts the cost.
         """
         # The program in memory holds the cost first. Thus a write of its full
         # metadata holds the cost too, also when it takes its copy before a
@@ -775,13 +776,12 @@ class ShinkaEvolveRunner:
         logger.info("Updating meta memory before the first proposal of the resume...")
         try:
             best_program = await self.async_db.get_best_program_async()
-            if best_program is None:
-                # The update writes its cost to the best program. With no best
-                # program, the programs wait for the update of a completed job
-                logger.warning(
-                    "No best program found for the meta update of the resume"
-                )
-                return
+            # The update writes its cost to the best program. With no correct
+            # program, the update runs as the update of a completed job does,
+            # and it writes its cost to a waiting program of the database
+            cost_program = (
+                best_program or self.meta_summarizer.evaluated_since_last_meta[-1]
+            )
             # The final summary does what a resume needs: one update of all
             # waiting programs, the state, the output file, and the cost in
             # the database
@@ -789,7 +789,7 @@ class ShinkaEvolveRunner:
                 self.meta_summarizer.perform_final_summary_async(
                     str(self.results_dir),
                     best_program,
-                    partial(self._store_meta_cost, best_program),
+                    partial(self._store_meta_cost, cost_program),
                     self._meta_state_path(),
                 ),
                 timeout=META_SUMMARY_TIMEOUT,

@@ -2105,24 +2105,48 @@ def test_resume_starts_when_the_write_of_the_missing_output_file_fails(
     assert meta_files(run_dir) == ["meta_4.txt"]
 
 
-def test_resume_with_no_correct_program_keeps_the_cost_of_its_update(tmp_path):
+@pytest.mark.parametrize("generations_left", [0, 1])
+def test_resume_with_no_correct_program_makes_the_due_update(
+    tmp_path, generations_left
+):
     run_dir = tmp_path / "run"
-    # No program of the search is correct, thus the database has no best program.
+    # An older results directory: 2 programs that are not correct, and no
+    # state file. Thus the database has no best program.
     launch(run_dir, None, generations=[1], nan_generations={0, 1})
+    assert read_state(run_dir) is None
 
     # A full interval waits at the resume.
-    meta_llm = StubMetaLLM("launch 2")
-    second = launch(run_dir, meta_llm, [2], meta_rec_interval=2, nan_generations={2})
-    third = launch(run_dir, StubMetaLLM("launch 3"), [], meta_rec_interval=2)
+    meta_llm = StubMetaLLM("launch 1")
+    totals: list[float] = []
+    num_generations = 2 + generations_left
+    prompts = search(run_dir, meta_llm, 2, num_generations, totals=totals)
 
-    # The cost total of the next launch holds each paid update.
-    assert third.api_cost == pytest.approx(update_costs(meta_llm.batches))
-    # The update of a resume writes its cost to the best program, thus this
-    # resume makes no update. The job of generation 2 makes the update, and
-    # its cost goes to the program of the job.
-    assert second.updates == 0
-    assert second.first_recommendation is None
-    assert meta_llm.batches == [[0, 1, 2]]
+    # The update of the resume runs with no best program, as the update of a
+    # completed job does on main. It writes its cost to a waiting program.
+    assert meta_llm.batches[0] == [0, 1]
+    paid = 0.01 * len(prompts) + update_costs(meta_llm.batches)
+    assert stored_meta_costs(run_dir) == pytest.approx(update_costs(meta_llm.batches))
+    assert totals[-1] == pytest.approx(paid)
+    if generations_left:
+        # The update comes before the first proposal. With no correct program,
+        # that proposal fixes a program, and as on main, a fix prompt holds no
+        # recommendation.
+        assert totals[0] == pytest.approx(update_costs(meta_llm.batches[:1]))
+
+    # A resume, then a second resume: no new update, and each total holds
+    # each paid update one time.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=2)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=2)
+    assert second_llm.batches == third_llm.batches == []
+    assert second.api_cost == third.api_cost == pytest.approx(paid)
+    # Each program has one summary. A fix proposal can take 2 queries of the
+    # stub, thus the summary text can have the mark of the next generation.
+    state = read_state(run_dir)
+    assert waiting_generations(state) == []
+    assert [
+        identifier for _, identifier in summary_labels(state["meta_summary"])
+    ] == list(range(num_generations))
 
 
 def test_resume_starts_when_its_update_gives_an_error(tmp_path, monkeypatch):
