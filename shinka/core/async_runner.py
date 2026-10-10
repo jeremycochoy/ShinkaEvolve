@@ -1321,8 +1321,9 @@ class ShinkaEvolveRunner:
             await self._restore_resume_progress()
         else:
             # A database with generation 0 only is not a resume: the launch
-            # evaluates the initial program again. But the meta state follows
-            # the database
+            # evaluates the initial program again. But the meta state and the
+            # cost total follow the database
+            self.total_api_cost = await self._get_total_api_costs()
             await self._load_meta_state()
 
             # Generate or copy initial program only if NOT resuming
@@ -1876,12 +1877,6 @@ class ShinkaEvolveRunner:
                     meta_cost,
                 ) = await self.meta_summarizer.update_meta_memory_async(best_program)
                 if updated_recs:
-                    # Save meta state first, so that a resume does not repeat the update
-                    self._save_meta_state()
-                    # Write meta output file asynchronously
-                    await self.meta_summarizer.write_meta_output_async(
-                        str(self.results_dir)
-                    )
                     # Store meta cost for tracking
                     if meta_cost > 0:
                         logger.info(
@@ -1894,6 +1889,15 @@ class ShinkaEvolveRunner:
                         if initial_program.metadata is None:
                             initial_program.metadata = {}
                         initial_program.metadata["meta_cost"] = meta_cost
+                        # Write the cost before the state: after a stop, the
+                        # database holds the cost of each update of the state
+                        await self._persist_program_metadata_async(initial_program)
+                    # Save meta state before the output file, so that a resume does not repeat the update
+                    self._save_meta_state()
+                    # Write meta output file asynchronously
+                    await self.meta_summarizer.write_meta_output_async(
+                        str(self.results_dir)
+                    )
 
         # Set baseline score for LLM selection
         if self.llm_selection is not None:

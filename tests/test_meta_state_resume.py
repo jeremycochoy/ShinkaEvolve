@@ -460,6 +460,12 @@ def test_update_of_the_initial_program_writes_the_meta_state(tmp_path):
         seen.start_state["meta_recommendations"]
         == "1. Recommendation of launch 1 update 1."
     )
+    assert seen.api_cost == pytest.approx(0.03)
+
+    # The next launch finds generation 0 only. Its cost total holds the update
+    # of launch 1, and the update of its own program of generation 0.
+    next_launch = launch(run_dir, StubMetaLLM("launch 2"), [], meta_rec_interval=1)
+    assert next_launch.api_cost == pytest.approx(0.06)
 
 
 def test_launch_on_generation_0_only_continues_the_meta_state(tmp_path, caplog):
@@ -837,6 +843,47 @@ def test_stop_between_the_writes_of_an_update_keeps_each_cost(
         evaluated_program_ids(run_dir)
     )
     assert meta_files(run_dir) == ["meta_2.txt"]
+
+
+@pytest.mark.parametrize("stop_before", ["save_meta_state", "write_meta_output_async"])
+def test_stop_in_the_update_of_the_initial_program_keeps_each_cost(
+    tmp_path, stop_before
+):
+    run_dir = tmp_path / "run"
+    # Launch 1 pays the update of generation 0. Then it stops as a stop of the
+    # process does, before the second write or before the third write.
+    first_llm = StubMetaLLM("launch 1")
+    search(run_dir, first_llm, 1, num_generations=2, stop_at=(stop_before, 1))
+    assert first_llm.batches == [[0]]
+    state_holds_the_update = stop_before == "write_meta_output_async"
+    assert (read_state(run_dir) is not None) == state_holds_the_update
+
+    # The database holds generation 0 only, thus each of the 2 next launches
+    # evaluates the initial program again: a new program, with its own summary.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=1)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=1)
+
+    if state_holds_the_update:
+        # Launch 2 does not make the update of launch 1 again. It writes the
+        # output file of that update from the state.
+        assert second_llm.batches == [[0]]
+        assert meta_files(run_dir) == ["meta_1.txt", "meta_2.txt", "meta_3.txt"]
+    else:
+        # The state does not hold the update, thus launch 2 summarizes the 2
+        # programs of generation 0: the search paid for the first program 2 times.
+        assert second_llm.batches == [[0, 0]]
+        assert meta_files(run_dir) == ["meta_2.txt", "meta_3.txt"]
+    assert third_llm.batches == [[0]]
+    # The cost total of each later launch holds each paid update one time.
+    paid = update_costs(first_llm.batches + second_llm.batches)
+    assert second.api_cost == pytest.approx(paid)
+    assert third.api_cost == pytest.approx(paid + update_costs(third_llm.batches))
+    state = read_state(run_dir)
+    assert state["total_programs_meta_processed"] == 3
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
 
 
 def test_state_file_holds_each_update_before_its_output_file(tmp_path):
