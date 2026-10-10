@@ -2215,35 +2215,64 @@ def test_failed_write_of_an_output_file_keeps_each_cost_in_the_cost_total(
     )
 
 
-def test_failed_write_of_the_output_file_of_the_setup_stops_the_launch_as_on_main(
-    tmp_path, monkeypatch
+def fail_the_first_output_write(patch) -> None:
+    """Make the first write of an output file fail, and the later succeed."""
+    write_file = AsyncMetaSummarizer._write_file
+    calls = itertools.count(1)
+
+    def fail_then_write(self, path, content):
+        if next(calls) == 1:
+            raise OSError("The disk is full.")
+        write_file(self, path, content)
+
+    patch.setattr(AsyncMetaSummarizer, "_write_file", fail_then_write)
+
+
+@pytest.mark.parametrize("setup_path", ["update", "metadata write"])
+def test_failed_write_of_the_output_file_of_the_setup_does_not_stop_the_search(
+    tmp_path, monkeypatch, caplog, setup_path
 ):
     run_dir = tmp_path / "run"
     # The write of the output file of the update of the initial program fails.
+    # On the path of the metadata write, the 3 cost writes of that update fail
+    # too, and the metadata write at the end of the setup puts the cost of
+    # the update into the database.
     meta_llm = StubMetaLLM("launch 1")
     totals: list[float] = []
     with monkeypatch.context() as patch:
-        patch.setattr(AsyncMetaSummarizer, "_write_file", no_write)
-        with pytest.raises(OSError):
-            search(run_dir, meta_llm, 1, num_generations=2, totals=totals)
+        fail_the_first_output_write(patch)
+        if setup_path == "metadata write":
+            fail_the_first_cost_writes(patch, async_summarizer.META_COST_WRITE_TRIES)
+        prompts = search(run_dir, meta_llm, 1, num_generations=2, totals=totals)
 
-    # The setup has no guard for an error of its meta update, thus the launch
-    # stops, as on main. Before the stop, the state file and the cost total
-    # took the update, and the database holds its cost.
-    paid = update_costs(meta_llm.batches)
-    assert meta_llm.batches == [[0]]
-    assert totals == [pytest.approx(paid)]
-    assert stored_meta_costs(run_dir) == pytest.approx(paid)
-    assert read_state(run_dir)["total_programs_meta_processed"] == 1
+    # The runner logs the error, and the search continues with the saved
+    # state: the first proposal gets the recommendation of the update, and
+    # the cost total holds its cost.
+    assert any(
+        record.levelno == logging.ERROR and "meta output file" in record.getMessage()
+        for record in caplog.records
+    )
+    assert meta_llm.batches == [[0], [1]]
+    assert "Recommendation of launch 1 update 1." in prompts[0]
+    assert totals[0] == pytest.approx(update_costs(meta_llm.batches[:1]))
+    paid = 0.01 * len(prompts) + update_costs(meta_llm.batches)
+    assert totals[-1] == pytest.approx(paid)
+    assert stored_meta_costs(run_dir) == pytest.approx(update_costs(meta_llm.batches))
+    # Only the output file of the update of the setup is missing.
+    assert meta_files(run_dir) == ["meta_2.txt"]
 
-    # The database holds generation 0 only, thus the next launch evaluates the
-    # initial program again, and it makes the update of that new program. It
-    # writes the missing output file, and its total holds each paid update.
-    second_llm = StubMetaLLM("launch 2")
+    # A resume, then a second resume: no new update, and each total holds
+    # each paid update one time.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
     second = launch(run_dir, second_llm, generations=[], meta_rec_interval=1)
-    assert second_llm.batches == [[0]]
-    assert second.api_cost == pytest.approx(paid + update_costs(second_llm.batches))
-    assert meta_files(run_dir) == ["meta_1.txt", "meta_2.txt"]
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=1)
+    assert second_llm.batches == third_llm.batches == []
+    assert second.api_cost == third.api_cost == pytest.approx(paid)
+    state = read_state(run_dir)
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1)]
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
 
 
 def make_program(program_id: str, generation: int, score: float) -> Program:

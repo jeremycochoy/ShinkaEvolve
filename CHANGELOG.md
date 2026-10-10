@@ -44,8 +44,10 @@ All notable changes to `shinka-evolve` are documented in this file.
   that cost: after that write, the state takes the update, as on `main`. The
   cost total of a launch counts the cost of an update when its write commits,
   so a later error, for example in the write of the output file, does not
-  remove it. A resume with no correct program also makes the update that is
-  due, and writes its cost to a waiting program.
+  remove it. An error in the write of an output file no longer stops the
+  setup: the runner logs it and continues with the saved state. A resume with
+  no correct program also makes the update that is due, and writes its cost to
+  a waiting program.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

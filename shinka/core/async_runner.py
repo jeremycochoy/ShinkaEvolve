@@ -737,6 +737,17 @@ class ShinkaEvolveRunner:
         self.total_api_cost += meta_cost
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
+    async def _write_meta_output(self) -> None:
+        """Write the output file of the last meta update.
+
+        An error goes to the log only: a search does not stop for its meta
+        summary.
+        """
+        try:
+            await self.meta_summarizer.write_meta_output_async(str(self.results_dir))
+        except Exception as e:
+            logger.error(f"❌ Failed to write the meta output file: {e}")
+
     async def _take_stored_meta_update(self, program: Program) -> None:
         """Put the pending meta update into the state after a metadata write.
 
@@ -762,7 +773,7 @@ class ShinkaEvolveRunner:
             self.total_api_cost += update.cost
             # Save meta state before the output file, so that a resume does not repeat the update
             self._save_meta_state()
-            await self.meta_summarizer.write_meta_output_async(str(self.results_dir))
+            await self._write_meta_output()
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
@@ -1965,10 +1976,7 @@ class ShinkaEvolveRunner:
                         )
                     # Save meta state before the output file, so that a resume does not repeat the update
                     self._save_meta_state()
-                    # Write meta output file asynchronously
-                    await self.meta_summarizer.write_meta_output_async(
-                        str(self.results_dir)
-                    )
+                    await self._write_meta_output()
 
         # Set baseline score for LLM selection
         if self.llm_selection is not None:
