@@ -36,9 +36,10 @@ All notable changes to `shinka-evolve` are documented in this file.
   reads and writes in one transaction, so a late cost write never replaces
   another one, and the cost total of a later launch holds the cost of each
   update of the state. The cost write waits in the write queue of the
-  database, as the other writes of a program do. When that write fails, or when the time limit of the
-  update passes in it, the update gives no result and its programs wait for
-  the next update.
+  database, as the other writes of a program do. When that write fails, the
+  update keeps its result and its cost, and it writes the cost again with no
+  new LLM query. The database adds the cost of an update one time, so a write
+  that a time limit cut can commit late with no second count.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

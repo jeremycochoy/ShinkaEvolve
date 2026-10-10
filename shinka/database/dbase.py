@@ -145,6 +145,23 @@ def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
     return decorator
 
 
+def add_meta_cost_to_metadata(
+    metadata: Dict[str, Any], meta_cost: float, update_id: str
+) -> bool:
+    """Add the cost of a meta update to the metadata of a program, one time.
+
+    The metadata keeps the id of each meta update whose cost it holds. A
+    missing cost counts as 0. Returns False when the metadata already holds
+    the update: then it does not change.
+    """
+    update_ids = metadata.get("meta_cost_update_ids") or []
+    if update_id in update_ids:
+        return False
+    metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
+    metadata["meta_cost_update_ids"] = [*update_ids, update_id]
+    return True
+
+
 @dataclass
 class Program:
     """Represents a program in the database"""
@@ -1694,15 +1711,20 @@ class ProgramDatabase:
         ]
         return sorted(programs, key=lambda p: (p.generation, p.timestamp))
 
-    def add_meta_cost(self, program_id: str, meta_cost: float) -> Optional[float]:
+    def add_meta_cost(
+        self, program_id: str, meta_cost: float, update_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Add the cost of a meta update to the metadata of a program.
 
         The read and the write of the metadata are in one IMMEDIATE
         transaction. It holds the write lock of the database from the read to
         the commit, thus no other write comes between them, and a cost write
         never loses an other cost write. A missing cost counts as 0, and each
-        other field of the metadata stays as it is. Returns the new meta cost
-        of the program, or None when the database does not hold the program.
+        other field of the metadata stays as it is. The metadata keeps the id
+        of each update whose cost it holds, thus a second write of an update
+        adds nothing: a write that a time limit cut can commit after its
+        retry. Returns the meta cost fields of the program, or None when the
+        database does not hold the program.
         """
         if not self.cursor or not self.conn:
             raise ConnectionError("DB not connected.")
@@ -1717,13 +1739,16 @@ class ProgramDatabase:
             if row is None:
                 return None
             metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-            metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
-            self.cursor.execute(
-                "UPDATE programs SET metadata = ? WHERE id = ?",
-                (json.dumps(metadata), program_id),
-            )
-            self.conn.commit()
-            return metadata["meta_cost"]
+            if add_meta_cost_to_metadata(metadata, meta_cost, update_id):
+                self.cursor.execute(
+                    "UPDATE programs SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata), program_id),
+                )
+                self.conn.commit()
+            return {
+                "meta_cost": metadata["meta_cost"],
+                "meta_cost_update_ids": metadata["meta_cost_update_ids"],
+            }
         finally:
             # Release the write lock when the add stops before its commit
             if self.conn.in_transaction:

@@ -24,7 +24,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from shinka.core import EvolutionConfig, ShinkaEvolveRunner, async_runner
+from shinka.core import (
+    EvolutionConfig,
+    ShinkaEvolveRunner,
+    async_runner,
+    async_summarizer,
+)
 from shinka.core.async_runner import AsyncRunningJob
 from shinka.core.async_summarizer import AsyncMetaSummarizer
 from shinka.core.summarizer import MetaSummarizer
@@ -72,6 +77,12 @@ def offline_runner(monkeypatch, tmp_path):
     )
     yield
     refresh_model_catalog(config)
+
+
+@pytest.fixture(autouse=True)
+def no_retry_delay(monkeypatch):
+    """Try a failed cost write again with no delay."""
+    monkeypatch.setattr(async_summarizer, "META_COST_WRITE_RETRY_DELAY", 0.0)
 
 
 @dataclass
@@ -964,7 +975,7 @@ def test_stop_in_the_update_of_the_initial_program_keeps_each_cost(
     )
 
 
-def slow_cost_write(db, program_id, meta_cost):
+def slow_cost_write(db, program_id, meta_cost, update_id):
     """Take the place of the cost write of a meta update when it is slow.
 
     Each meta update writes its cost with `ProgramDatabase.add_meta_cost()`
@@ -976,7 +987,7 @@ def slow_cost_write(db, program_id, meta_cost):
     raise RuntimeError("The process stopped before the write of the cost.")
 
 
-def locked_cost_write(db, program_id, meta_cost):
+def locked_cost_write(db, program_id, meta_cost, update_id):
     """Take the place of the same write when the database is locked."""
     raise sqlite3.OperationalError("database is locked")
 
@@ -1014,11 +1025,11 @@ def test_time_limit_in_the_cost_write_of_an_update_keeps_each_cost(
     assert state["total_programs_meta_processed"] == 0
     assert state["meta_recommendations"] is None
     assert waiting_generations(state) == [0, 1]
-    # On a resume, the programs stay in the waiting list after the time limit.
-    # Thus the final summary of launch 1 takes them again, with the same end.
-    cut_updates = 2 if path == "resume" else 1
-    assert first_llm.batches == [[0, 1]] * cut_updates
-    assert len(first_llm.step3_messages) == cut_updates
+    # On a resume, the update keeps its result after the time limit. Thus the
+    # final summary of launch 1 writes its cost again, with no new LLM query,
+    # and the time limit cuts that write too.
+    assert first_llm.batches == [[0, 1]]
+    assert len(first_llm.step3_messages) == 1
 
     # A resume, then a second resume.
     second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
@@ -1055,10 +1066,13 @@ def test_failed_cost_write_of_an_update_keeps_each_cost(tmp_path, monkeypatch, p
     with monkeypatch.context() as patch:
         fail_cost_writes(patch)
         first = launch(run_dir, first_llm, generations, meta_rec_interval=interval)
-    assert len(first_llm.step3_messages) == len(first_llm.batches) >= 1
+    # The update keeps its result, and the final summary writes its cost
+    # again, with no new LLM query.
+    assert first_llm.batches == [[0, 1]]
+    assert len(first_llm.step3_messages) == 1
 
-    # The database holds no cost of an update, thus no update goes into the
-    # state: not in memory, and not in the state file.
+    # The cost writes of the update fail, thus no update goes into the state:
+    # not in memory, and not in the state file.
     assert first.first_recommendation is None
     assert [memory["total_programs_meta_processed"] for memory in first.memory] == [
         0 for _ in generations
@@ -1077,57 +1091,22 @@ def test_failed_cost_write_of_an_update_keeps_each_cost(tmp_path, monkeypatch, p
     # The resume makes the update again, and it writes the cost of that update.
     assert second_llm.batches == [[0, 1]]
     assert third_llm.batches == []
+    # The program of a completed job holds the cost of its update in memory,
+    # thus the write of its full metadata puts that cost into the database.
+    # The update of a resume and the final summary write to a copy of the
+    # best program, and no full write of that copy comes after.
+    stored = update_costs(first_llm.batches) if path == "completed job" else 0.0
     # The cost total of each later launch holds each update of its state one
-    # time. The total of the resume is the total at its first proposal.
+    # time, and each other stored update. The total of the resume is the
+    # total at its first proposal.
     paid_at_the_first_proposal = update_costs(second_llm.batches[: second.updates])
-    assert second.api_cost == pytest.approx(paid_at_the_first_proposal)
-    assert third.api_cost == pytest.approx(update_costs(second_llm.batches))
+    assert second.api_cost == pytest.approx(stored + paid_at_the_first_proposal)
+    assert third.api_cost == pytest.approx(stored + update_costs(second_llm.batches))
     state = read_state(run_dir)
     assert sorted(state["processed_program_ids"]) == sorted(
         evaluated_program_ids(run_dir)
     )
     assert meta_files(run_dir) == ["meta_2.txt"]
-
-
-def test_failed_cost_write_of_the_initial_program_update_keeps_each_cost(
-    tmp_path, monkeypatch
-):
-    run_dir = tmp_path / "run"
-    add_meta_cost = ProgramDatabase.add_meta_cost
-    calls = []
-
-    def fail_the_first_cost_write(db, program_id, meta_cost):
-        calls.append(program_id)
-        if len(calls) == 1:
-            return locked_cost_write(db, program_id, meta_cost)
-        return add_meta_cost(db, program_id, meta_cost)
-
-    # Launch 1 pays the update of the initial program, and the write of its
-    # cost fails.
-    first_llm = StubMetaLLM("launch 1")
-    with monkeypatch.context() as patch:
-        patch.setattr(ProgramDatabase, "add_meta_cost", fail_the_first_cost_write)
-        first = launch(run_dir, first_llm, generations=[], meta_rec_interval=1)
-
-    # The update gives no result, and the launch continues: the search starts
-    # with the program in the waiting list, and the final summary takes it.
-    assert len(calls) == 2
-    assert first.first_recommendation is None
-    assert first.start_state is None
-    assert first_llm.batches == [[0], [0]]
-    state = read_state(run_dir)
-    assert state["total_programs_meta_processed"] == 1
-    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 2."
-
-    # The database holds the cost of the final summary only: the state does
-    # not hold the failed update. The next launch finds generation 0 only: its
-    # total holds that cost, and the update of its own program of generation 0.
-    second_llm = StubMetaLLM("launch 2")
-    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=1)
-    assert second_llm.batches == [[0]]
-    assert second.api_cost == pytest.approx(
-        update_costs(first_llm.batches[1:] + second_llm.batches)
-    )
 
 
 class RisingPriceMetaLLM(StubMetaLLM):
@@ -1153,49 +1132,52 @@ class OlderCostWriteCommitsLast:
         self.committed = []
         add_meta_cost = ProgramDatabase.add_meta_cost
 
-        def write_in_this_order(db, program_id, meta_cost):
+        def write_in_this_order(db, program_id, meta_cost, update_id):
             number = next(self.calls)
             if number == 1:
                 assert self.second_write_committed.wait(timeout=30)
-            stored_cost = add_meta_cost(db, program_id, meta_cost)
+            stored = add_meta_cost(db, program_id, meta_cost, update_id)
             self.committed.append(number)
             if number == 2:
                 self.second_write_committed.set()
-            return stored_cost
+            return stored
 
         patch.setattr(ProgramDatabase, "add_meta_cost", write_in_this_order)
 
 
-def test_older_cost_write_that_commits_last_keeps_each_cost(tmp_path, monkeypatch):
+def test_cut_cost_write_that_commits_after_its_retry_adds_its_cost_one_time(
+    tmp_path, monkeypatch
+):
     run_dir = tmp_path / "run"
     # A launch with no meta summary gives the 2 programs of the update.
     launch(run_dir, None, generations=[1])
     # Launch 1 is a resume with no generation left. The cost write of its
     # update waits on the database, and the time limit passes in that write.
-    # Then the final summary makes the update again, at a higher price, and
-    # its cost write commits first. The cut write commits last.
+    # Then the final summary writes the cost of that update again, with no
+    # new LLM query, and that write commits first. The cut write commits last.
     first_llm = RisingPriceMetaLLM("launch 1")
     with monkeypatch.context() as patch:
         patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 2.0)
         order = OlderCostWriteCommitsLast(patch)
         prompts = search(run_dir, first_llm, 2, num_generations=2)
     assert prompts == []
-    assert first_llm.batches == [[0, 1], [0, 1]]
+    assert first_llm.batches == [[0, 1]]
     assert order.committed == [2, 1]
     state = read_state(run_dir)
-    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 2."
+    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 1."
     assert state["total_programs_meta_processed"] == 2
 
     # A resume, then a second resume.
     second = launch(run_dir, StubMetaLLM("launch 2"), [], meta_rec_interval=2)
     third = launch(run_dir, StubMetaLLM("launch 3"), [], meta_rec_interval=2)
 
-    # The database holds the cost of the 2 paid updates: 0.04 for the cut
-    # update, and 0.08 for the update of the state. Thus the cost total of each
-    # later launch holds each paid update of its state one time.
+    # The 2 writes have the same update id, thus the database adds the cost
+    # of the update (0.04) one time. The cost total of each later launch
+    # holds it one time.
     assert second.updates == third.updates == 0
-    assert second.api_cost == pytest.approx(0.04 + 0.08)
-    assert third.api_cost == pytest.approx(0.04 + 0.08)
+    assert stored_meta_costs(run_dir) == pytest.approx(0.04)
+    assert second.api_cost == pytest.approx(0.04)
+    assert third.api_cost == pytest.approx(0.04)
 
 
 def add_cost_to_each_program(run_dir: Path, meta_cost: float) -> None:
@@ -1278,6 +1260,91 @@ def test_cost_write_of_each_update_adds_to_the_cost_in_the_database(tmp_path, pa
     )
 
 
+@pytest.mark.parametrize("path", COST_WRITE_PATHS)
+def test_failed_cost_write_is_written_again_before_the_state_takes_the_update(
+    tmp_path, monkeypatch, path
+):
+    run_dir = tmp_path / "run"
+    interval, generations = COST_WRITE_PATHS[path]
+    if path == "resume":
+        # A launch with no meta summary gives the 2 programs of the update.
+        launch(run_dir, None, generations=[1])
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    calls = []
+
+    def fail_the_first_cost_write(db, *args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return add_meta_cost(db, *args)
+
+    # The first cost write of launch 1 fails. The later writes of the launch
+    # succeed, also the write of the full metadata of each program.
+    first_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        patch.setattr(ProgramDatabase, "add_meta_cost", fail_the_first_cost_write)
+        first = launch(run_dir, first_llm, generations, meta_rec_interval=interval)
+
+    # The update keeps its result and its cost, and it writes the cost again
+    # with the same update id and no new LLM query. Then the state takes it.
+    assert len(first_llm.batches) == 1
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    paid = update_costs(first_llm.batches)
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    state = read_state(run_dir)
+    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 1."
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    if path in ("initial program", "resume"):
+        # The update comes before the first proposal, thus that proposal gets
+        # its recommendation, and the cost total holds its cost.
+        assert first.first_recommendation == "Recommendation of launch 1 update 1."
+        assert first.api_cost == pytest.approx(paid)
+
+    # The cost total of the next launch holds the cost of the update one time.
+    # With generation 0 only, that launch also makes its own update.
+    second_llm = StubMetaLLM("launch 2")
+    second = launch(run_dir, second_llm, [], meta_rec_interval=interval)
+    assert second.api_cost == pytest.approx(
+        paid + update_costs(second_llm.batches[: second.updates])
+    )
+
+
+def test_final_summary_takes_the_pending_update_then_the_later_programs(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    calls = []
+
+    def fail_until_the_final_summary(db, *args):
+        calls.append(args)
+        # The job of generation 1 starts the update, and the jobs of
+        # generations 2 and 3 write its cost again: 3 calls of 3 tries each.
+        if len(calls) <= 3 * async_summarizer.META_COST_WRITE_TRIES:
+            raise sqlite3.OperationalError("database is locked")
+        return add_meta_cost(db, *args)
+
+    meta_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        patch.setattr(ProgramDatabase, "add_meta_cost", fail_until_the_final_summary)
+        launch(run_dir, meta_llm, generations=[1, 2, 3], meta_rec_interval=2)
+
+    # The update of generations 0 and 1 waits for its cost write until the
+    # final summary. Then the final summary makes one more update, on the
+    # programs that came after it.
+    assert meta_llm.batches == [[0, 1], [2, 3]]
+    assert meta_files(run_dir) == ["meta_2.txt", "meta_4.txt"]
+    state = read_state(run_dir)
+    assert waiting_generations(state) == []
+    assert sorted(state["processed_program_ids"]) == sorted(
+        evaluated_program_ids(run_dir)
+    )
+    assert stored_meta_costs(run_dir) == pytest.approx(update_costs(meta_llm.batches))
+
+
 def record_async_databases(patch) -> list[AsyncProgramDatabase]:
     """Record each async database that a runner builds."""
     databases = []
@@ -1342,9 +1409,9 @@ def test_cost_write_waits_in_the_write_queue_of_the_database(
     )
     add_meta_cost = ProgramDatabase.add_meta_cost
 
-    def record_the_cost_write(db, program_id, meta_cost):
+    def record_the_cost_write(db, program_id, meta_cost, update_id):
         meta_llm.threads["cost write"] = threading.current_thread()
-        return add_meta_cost(db, program_id, meta_cost)
+        return add_meta_cost(db, program_id, meta_cost, update_id)
 
     monkeypatch.setattr(ProgramDatabase, "add_meta_cost", record_the_cost_write)
 
@@ -1376,7 +1443,7 @@ def test_update_writes_its_cost_before_its_result_goes_into_the_state():
     # The cost, and the state that the summarizer holds at the write of the cost.
     cost_writes = []
 
-    async def store_cost(meta_cost):
+    async def store_cost(meta_cost, update_id):
         cost_writes.append(
             (
                 meta_cost,
@@ -1407,7 +1474,7 @@ def test_update_with_no_cost_makes_no_cost_write():
     summarizer = make_summarizer(FreeMetaLLM("launch 1"))
     cost_writes = []
 
-    async def store_cost(meta_cost):
+    async def store_cost(meta_cost, update_id):
         cost_writes.append(meta_cost)
 
     recommendations, meta_cost = asyncio.run(
@@ -1418,6 +1485,49 @@ def test_update_with_no_cost_makes_no_cost_write():
     assert recommendations == "1. Recommendation of launch 1 update 1."
     assert meta_cost == 0.0
     assert summarizer.total_programs_processed == 2
+
+
+def test_update_writes_its_cost_again_with_no_new_llm_query():
+    meta_llm = StubMetaLLM("launch 1")
+    summarizer = make_summarizer(meta_llm)
+    # The cost, the update id and the count of processed programs at each
+    # try of the cost write. The first 4 tries fail.
+    writes = []
+    other_writes = []
+
+    async def store_cost(meta_cost, update_id):
+        writes.append((meta_cost, update_id, summarizer.total_programs_processed))
+        if len(writes) <= 4:
+            raise sqlite3.OperationalError("database is locked")
+
+    async def other_store_cost(meta_cost, update_id):
+        other_writes.append(meta_cost)
+
+    # Each try of the first call fails: the update keeps its result and its
+    # cost, and the state does not change.
+    first = asyncio.run(summarizer.update_meta_memory_async(None, store_cost))
+    assert first == (None, 0.0)
+    assert len(writes) == async_summarizer.META_COST_WRITE_TRIES
+    assert summarizer.total_programs_processed == 0
+    assert len(summarizer.evaluated_since_last_meta) == 2
+
+    # The next call writes the cost of that update again, with the write and
+    # the update id of that update, and with no new LLM query. Then the state
+    # takes the update.
+    recommendations, meta_cost = asyncio.run(
+        summarizer.update_meta_memory_async(None, other_store_cost)
+    )
+    assert recommendations == "1. Recommendation of launch 1 update 1."
+    assert meta_cost == pytest.approx(0.04)
+    assert meta_llm.batches == [[0, 1]]
+    assert other_writes == []
+    assert len(writes) == 5
+    assert len({update_id for _, update_id, _ in writes}) == 1
+    for cost, _, processed in writes:
+        assert cost == pytest.approx(0.04)
+        assert processed == 0
+    assert summarizer.total_programs_processed == 2
+    assert summarizer.evaluated_since_last_meta == []
 
 
 def test_cost_write_to_a_program_that_the_database_does_not_hold_gives_no_update(
@@ -1444,6 +1554,52 @@ def test_cost_write_to_a_program_that_the_database_does_not_hold_gives_no_update
     assert recommendations is None
     assert summarizer.total_programs_processed == 0
     assert len(summarizer.evaluated_since_last_meta) == 2
+
+
+def test_full_metadata_write_that_commits_after_a_retry_keeps_the_cost(
+    tmp_path, monkeypatch
+):
+    config = DatabaseConfig(db_path=str(tmp_path / "programs.sqlite"), num_islands=1)
+    db = ProgramDatabase(config=config, embedding_model="")
+    program = make_program("gen-1", generation=1, score=1.0)
+    db.add(program)
+    runner = make_runner(tmp_path / "run", StubMetaLLM("launch 1"), 2)
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    calls = []
+
+    def fail_the_first_cost_write(db, *args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return add_meta_cost(db, *args)
+
+    async def write():
+        runner.async_db = AsyncProgramDatabase(db)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await runner._store_meta_cost(program, 0.04, "update-1")
+            # The write of the full metadata at the end of the side effects of
+            # the program takes its copy of the metadata after the failed cost
+            # write. An update of an other job writes the cost again, and that
+            # write commits first. Then the full metadata write commits.
+            full_metadata = dict(program.metadata)
+            await runner._store_meta_cost(program, 0.04, "update-1")
+            await runner.async_db.update_program_metadata_async(
+                program.id, full_metadata
+            )
+        finally:
+            await runner.async_db.close_async()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ProgramDatabase, "add_meta_cost", fail_the_first_cost_write)
+        asyncio.run(write())
+
+    # The program in memory got the cost and the update id before the first
+    # cost write. Thus the full metadata write keeps the cost, one time.
+    metadata = db.get("gen-1").metadata
+    assert metadata["meta_cost"] == pytest.approx(0.04)
+    assert metadata["meta_cost_update_ids"] == ["update-1"]
+    db.close()
 
 
 def test_state_file_holds_each_update_before_its_output_file(tmp_path):
@@ -1845,23 +2001,30 @@ def test_add_meta_cost_adds_to_the_cost_in_the_database(tmp_path):
     db.add(program)
 
     # The first write adds its cost to 0, and the next write adds to the sum.
-    assert db.add_meta_cost("gen-1", 0.04) == pytest.approx(0.04)
-    assert db.add_meta_cost("gen-1", 0.08) == pytest.approx(0.12)
+    first = db.add_meta_cost("gen-1", 0.04, "update-1")
+    assert first["meta_cost"] == pytest.approx(0.04)
+    stored = db.add_meta_cost("gen-1", 0.08, "update-2")
+    assert stored["meta_cost"] == pytest.approx(0.12)
+    assert stored["meta_cost_update_ids"] == ["update-1", "update-2"]
+    # A second write of an update adds nothing: a write that a time limit cut
+    # can commit after the write that took its place.
+    assert db.add_meta_cost("gen-1", 0.04, "update-1") == stored
 
     # The writes keep each other field of the metadata, also a NaN.
     metadata = db.get("gen-1").metadata
     assert metadata["meta_cost"] == pytest.approx(0.12)
+    assert metadata["meta_cost_update_ids"] == ["update-1", "update-2"]
     assert metadata["patch_name"] == "patch_1"
     assert metadata["api_costs"] == 0.5
     assert math.isnan(metadata["max_similarity"])
     # A program that the database does not hold gets no cost. An add that
     # stops before its commit releases the write lock.
-    assert db.add_meta_cost("gen-2", 0.04) is None
+    assert db.add_meta_cost("gen-2", 0.04, "update-3") is None
     assert not db.conn.in_transaction
     db.cursor.execute("UPDATE programs SET metadata = 'not JSON' WHERE id = 'gen-1'")
     db.conn.commit()
     with pytest.raises(json.JSONDecodeError):
-        db.add_meta_cost("gen-1", 0.04)
+        db.add_meta_cost("gen-1", 0.04, "update-3")
     assert not db.conn.in_transaction
     db.close()
 
@@ -1874,7 +2037,7 @@ def test_two_cost_writes_at_the_same_time_keep_each_cost(tmp_path):
     def second_cost_write():
         second_db = ProgramDatabase(config=config, embedding_model="")
         try:
-            second_db.add_meta_cost("gen-1", 0.08)
+            second_db.add_meta_cost("gen-1", 0.08, "update-2")
         finally:
             second_db.close()
 
@@ -1888,8 +2051,9 @@ def test_two_cost_writes_at_the_same_time_keep_each_cost(tmp_path):
             second_write.join(timeout=1.0)
 
     db.conn.set_trace_callback(start_the_second_write)
-    assert db.add_meta_cost("gen-1", 0.04) == pytest.approx(0.04)
+    first = db.add_meta_cost("gen-1", 0.04, "update-1")
     db.conn.set_trace_callback(None)
+    assert first["meta_cost"] == pytest.approx(0.04)
     second_write.join()
 
     # The first write holds the write lock from its read to its commit. Thus

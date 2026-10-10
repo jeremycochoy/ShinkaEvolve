@@ -24,6 +24,7 @@ import rich.box
 
 from shinka.database import ProgramDatabase, DatabaseConfig, Program
 from shinka.database.async_dbase import AsyncProgramDatabase
+from shinka.database.dbase import add_meta_cost_to_metadata
 from shinka.database.prompt_dbase import (
     SystemPromptDatabase,
     SystemPromptConfig,
@@ -702,7 +703,9 @@ class ShinkaEvolveRunner:
             for program in self.db.get_evaluated_programs()
         )
 
-    async def _store_meta_cost(self, program: Program, meta_cost: float) -> None:
+    async def _store_meta_cost(
+        self, program: Program, meta_cost: float, update_id: str
+    ) -> None:
         """Add the cost of a meta update to the metadata of a program in the database.
 
         Each meta update writes its cost with this method. The update of a
@@ -712,15 +715,21 @@ class ShinkaEvolveRunner:
         goes into the meta state: after a stop, the database holds the cost
         of each update of the state. The write waits in the write queue of the
         database, and the database adds the cost to its own value in one
-        transaction. The metadata of the program then gets the new value.
+        transaction, one time for each update id.
         """
-        stored_cost = await self.async_db.add_meta_cost_async(program.id, meta_cost)
-        if stored_cost is None:
-            raise ValueError(f"The database does not hold program {program.id}")
-        # A later write of the full metadata of the program keeps this value
+        # The program in memory holds the cost first. Thus a write of its full
+        # metadata holds the cost too, also when it takes its copy before a
+        # retry of this write, and the update id stops a second add
         if program.metadata is None:
             program.metadata = {}
-        program.metadata["meta_cost"] = stored_cost
+        add_meta_cost_to_metadata(program.metadata, meta_cost, update_id)
+        stored = await self.async_db.add_meta_cost_async(
+            program.id, meta_cost, update_id
+        )
+        if stored is None:
+            raise ValueError(f"The database does not hold program {program.id}")
+        # The database can hold the cost of other updates of the program
+        program.metadata.update(stored)
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
     async def _summarize_waiting_programs(self) -> None:
