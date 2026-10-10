@@ -749,14 +749,15 @@ class ShinkaEvolveRunner:
             logger.error(f"❌ Failed to write the meta output file: {e}")
 
     async def _take_stored_meta_update(self, program: Program) -> None:
-        """Put the pending meta update into the state after a metadata write.
+        """Put the pending meta update into the state when a program holds its cost.
 
         The program of a cost write holds the cost of the update in memory
         before the write. Thus when the cost writes of the update fail, a
         later write of the full metadata of that program puts the cost into
-        the database. The setup and a completed job make that write. Then the
-        state takes the update, and the cost total counts its cost, as after a
-        cost write.
+        the database. The setup and a completed job make that write. A cost
+        write that a time limit cut can also commit later, before the end of
+        the launch. Then the state takes the update, and the cost total counts
+        its cost, as after a cost write.
         """
         update_ids = (program.metadata or {}).get("meta_cost_update_ids")
         if self.meta_summarizer is None or not update_ids:
@@ -774,6 +775,23 @@ class ShinkaEvolveRunner:
             # Save meta state before the output file, so that a resume does not repeat the update
             self._save_meta_state()
             await self._write_meta_output()
+
+    async def _take_late_meta_update(self) -> None:
+        """Put the pending meta update into the state when its cost committed late.
+
+        A time limit cuts a cost write in the event loop only: its worker
+        thread can commit after the time limit. The cleanup of the launch
+        waits for the writers of the database. Thus after the cleanup, the
+        database holds the cost of such a write. An error does not stop the
+        end of the launch.
+        """
+        if self.meta_summarizer is None or self.meta_summarizer.pending_update is None:
+            return
+        try:
+            for program in self.db.get_all_programs():
+                await self._take_stored_meta_update(program)
+        except Exception as e:
+            logger.error(f"❌ Error in the late take of the pending meta update: {e}")
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
@@ -1350,6 +1368,7 @@ class ShinkaEvolveRunner:
             if tasks:  # Only gather if there are tasks
                 await asyncio.gather(*tasks, return_exceptions=True)
             await self._cleanup_async()
+            await self._take_late_meta_update()
 
         # Print final summary
         await self._print_final_summary()

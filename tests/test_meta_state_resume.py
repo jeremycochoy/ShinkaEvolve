@@ -1089,6 +1089,61 @@ def test_time_limit_in_the_cost_write_of_an_update_keeps_each_cost(
     assert meta_files(run_dir) == ["meta_2.txt"]
 
 
+def commit_each_cost_write_late(patch) -> None:
+    """Make each write of a meta cost commit after 0.5 seconds.
+
+    The time limit of the test is shorter. Thus it cuts the write in the event
+    loop, and the worker thread of the write commits after the time limit.
+    """
+    add_meta_cost = ProgramDatabase.add_meta_cost
+
+    def write_late(db, *args):
+        time.sleep(0.5)
+        return add_meta_cost(db, *args)
+
+    patch.setattr(ProgramDatabase, "add_meta_cost", write_late)
+
+
+def test_cost_write_that_commits_after_the_time_limit_keeps_the_output_file(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    # A fresh search of 2 correct programs. Step 3 of the final summary ends
+    # near the time limit, and the cost write commits after it. The cleanup
+    # at the end of the launch waits for the writers of the database.
+    meta_llm = StubMetaLLM("launch 1")
+    totals: list[float] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 0.1)
+        commit_each_cost_write_late(patch)
+        prompts = search(run_dir, meta_llm, 5, 2, totals=totals)
+
+    # The database holds the cost of the update. Thus the state takes the
+    # update, and the output file holds it, as on main. The cost total counts
+    # the cost one time.
+    assert meta_llm.batches == [[0, 1]]
+    paid = update_costs(meta_llm.batches)
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    assert meta_files(run_dir) == ["meta_2.txt"]
+    output = (run_dir / "meta" / "meta_2.txt").read_text(encoding="utf-8")
+    assert "1. Recommendation of launch 1 update 1." in output
+    assert summary_labels(output) == [(0, 0), (1, 1)]
+    state = read_state(run_dir)
+    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 1."
+    assert waiting_generations(state) == []
+    paid += 0.01 * len(prompts)
+    assert totals[-1] == pytest.approx(paid)
+
+    # A resume, then a second resume: no new update, and each total holds the
+    # paid update one time.
+    second_llm, third_llm = StubMetaLLM("launch 2"), StubMetaLLM("launch 3")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=5)
+    third = launch(run_dir, third_llm, generations=[], meta_rec_interval=5)
+    assert second_llm.batches == third_llm.batches == []
+    assert second.api_cost == third.api_cost == pytest.approx(paid)
+    assert meta_files(run_dir) == ["meta_2.txt"]
+
+
 @pytest.mark.parametrize("path", ["resume", "final summary"])
 def test_failed_cost_write_of_an_update_keeps_each_cost(tmp_path, monkeypatch, path):
     run_dir = tmp_path / "run"
