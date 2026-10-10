@@ -31,28 +31,19 @@ All notable changes to `shinka-evolve` are documented in this file.
   after each meta update and at the end of a run. A launch on a database with
   an evaluated program loads that file, and adds each evaluated program of the
   database that the state does not hold. A resume then makes the meta update
-  that is due before the first new proposal. A meta update adds its cost to
-  the value in the database before its result goes into the state. The add
-  reads and writes in one transaction, so a late cost write never replaces
-  another one, and the cost total of a later launch holds the cost of each
-  update of the state. The cost write waits in the write queue of the
-  database, as the other writes of a program do. When that write fails, the
-  update keeps its result and its cost, and it writes the cost again with no
-  new LLM query. The database adds the cost of an update one time, so a write
-  that a time limit cut can commit late with no second count. The setup and a
-  completed job then write the full metadata of their program, which holds
-  that cost: after that write, the state takes the update, as on `main`. The
-  cost total of a launch counts the cost of an update when its write commits,
-  so a later error, for example in the write of the output file, does not
-  remove it. An error in the write of an output file no longer stops the
-  setup: the runner logs it and continues with the saved state. At the end of
-  a launch, after the wait for the database writers, a pending update whose
-  cost write committed after its time limit goes into the state, the cost
-  total and the output file. A pending update with no cost in the database
-  goes into the output file only, as on `main`. A resume with no correct
-  program also makes the update that is due, and writes its cost to a waiting
-  program. With no generation left, that update runs whatever the interval,
-  because the final summary needs a correct program.
+  that is due before the first new proposal. As before, the state in memory
+  takes a meta update after its step 3, then the output file comes, then the
+  cost total counts the update. A task then adds the cost to the value in the
+  database, in the write queue of the database, one time for each update id,
+  so a write that commits and then fails adds nothing. The saved state holds
+  an update only when the database holds its cost: until that write, a save
+  writes the state from before the update, and a later launch makes the update
+  again when the write fails or the process stops. A full metadata write of a
+  program keeps the meta cost of the database. An error in the write of an
+  output file no longer stops the setup: the runner logs it. A resume with no
+  correct program also makes the update that is due, and writes its cost to a
+  waiting program. With no generation left, that update runs whatever the
+  interval, because the final summary needs a correct program.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

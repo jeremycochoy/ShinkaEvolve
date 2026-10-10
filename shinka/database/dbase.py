@@ -145,21 +145,9 @@ def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
     return decorator
 
 
-def add_meta_cost_to_metadata(
-    metadata: Dict[str, Any], meta_cost: float, update_id: str
-) -> bool:
-    """Add the cost of a meta update to the metadata of a program, one time.
-
-    The metadata keeps the id of each meta update whose cost it holds. A
-    missing cost counts as 0. Returns False when the metadata already holds
-    the update: then it does not change.
-    """
-    update_ids = metadata.get("meta_cost_update_ids") or []
-    if update_id in update_ids:
-        return False
-    metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
-    metadata["meta_cost_update_ids"] = [*update_ids, update_id]
-    return True
+# The metadata fields of the meta costs of a program. Only add_meta_cost()
+# changes them in the database
+META_COST_FIELDS = ("meta_cost", "meta_cost_update_ids")
 
 
 @dataclass
@@ -1722,9 +1710,9 @@ class ProgramDatabase:
         never loses an other cost write. A missing cost counts as 0, and each
         other field of the metadata stays as it is. The metadata keeps the id
         of each update whose cost it holds, thus a second write of an update
-        adds nothing: a write that a time limit cut can commit after its
-        retry. Returns the meta cost fields of the program, or None when the
-        database does not hold the program.
+        adds nothing: a write that commits, and then fails. Returns the meta
+        cost fields of the program, or None when the database does not hold
+        the program.
         """
         if not self.cursor or not self.conn:
             raise ConnectionError("DB not connected.")
@@ -1739,18 +1727,52 @@ class ProgramDatabase:
             if row is None:
                 return None
             metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-            if add_meta_cost_to_metadata(metadata, meta_cost, update_id):
+            update_ids = metadata.get("meta_cost_update_ids") or []
+            if update_id not in update_ids:
+                metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
+                metadata["meta_cost_update_ids"] = [*update_ids, update_id]
                 self.cursor.execute(
                     "UPDATE programs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata), program_id),
                 )
                 self.conn.commit()
-            return {
-                "meta_cost": metadata["meta_cost"],
-                "meta_cost_update_ids": metadata["meta_cost_update_ids"],
-            }
+            return {field: metadata[field] for field in META_COST_FIELDS}
         finally:
             # Release the write lock when the add stops before its commit
+            if self.conn.in_transaction:
+                self.conn.rollback()
+
+    def update_program_metadata(
+        self, program_id: str, metadata: Dict[str, Any]
+    ) -> None:
+        """Write the metadata of a program, with the meta costs of the database.
+
+        The cost write of a meta update can commit before this write. The
+        read and the write are in one IMMEDIATE transaction, thus this write
+        keeps the meta cost fields that the database holds, and it ignores
+        the meta cost fields of its metadata.
+        """
+        if not self.cursor or not self.conn:
+            raise ConnectionError("DB not connected.")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.cursor.execute(
+                "SELECT metadata FROM programs WHERE id = ?", (program_id,)
+            )
+            row = self.cursor.fetchone()
+            try:
+                stored = json.loads(row["metadata"]) if row and row["metadata"] else {}
+            except json.JSONDecodeError:
+                # The write replaces stored metadata that is not JSON, as before
+                stored = {}
+            metadata = {k: v for k, v in metadata.items() if k not in META_COST_FIELDS}
+            metadata.update({k: stored[k] for k in META_COST_FIELDS if k in stored})
+            self.cursor.execute(
+                "UPDATE programs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), program_id),
+            )
+            self.conn.commit()
+        finally:
             if self.conn.in_transaction:
                 self.conn.rollback()
 

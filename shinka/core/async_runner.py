@@ -24,7 +24,6 @@ import rich.box
 
 from shinka.database import ProgramDatabase, DatabaseConfig, Program
 from shinka.database.async_dbase import AsyncProgramDatabase
-from shinka.database.dbase import add_meta_cost_to_metadata
 from shinka.database.prompt_dbase import (
     SystemPromptDatabase,
     SystemPromptConfig,
@@ -81,7 +80,8 @@ from shinka.utils.languages import get_evolve_comment_prefix
 logger = logging.getLogger(__name__)
 
 META_STATE_FILENAME = "meta_memory.json"
-# Seconds for the final meta summary, and for the meta update of a resume
+# Seconds for the final meta summary, for the meta update of a resume, and for
+# the wait for the meta cost writes at the end of a launch
 META_SUMMARY_TIMEOUT = 600.0
 
 
@@ -486,6 +486,7 @@ class ShinkaEvolveRunner:
             self.meta_summarizer = AsyncMetaSummarizer(
                 sync_meta_summarizer,
                 async_meta_llm,
+                state_path=self._meta_state_path(),
             )
         else:
             self.meta_summarizer = None
@@ -708,33 +709,24 @@ class ShinkaEvolveRunner:
     ) -> None:
         """Add the cost of a meta update to the metadata of a program in the database.
 
-        Each meta update writes its cost with this method. The update of a
-        completed job and of the initial program write to the program that
-        started the update. The update of a resume and the final summary write
-        to the best program. With no correct program, the update of a resume
-        writes to a waiting program. The update calls this write before its
-        result goes into the meta state: after a stop, the database holds the
-        cost of each update of the state. The write waits in the write queue
-        of the database, and the database adds the cost to its own value in
-        one transaction, one time for each update id. When the write commits,
-        the cost total of the launch counts the cost.
+        Each meta update writes its cost with this method, in a task after
+        the update. The update of a completed job and of the initial program
+        write to the program that started the update. The update of a resume
+        and the final summary write to the best program. With no correct
+        program, the update of a resume writes to a waiting program. The write
+        waits in the write queue of the database, and the database adds the
+        cost to its own value in one transaction, one time for each update id.
         """
-        # The program in memory holds the cost first. Thus a write of its full
-        # metadata holds the cost too, also when it takes its copy before a
-        # retry of this write, and the update id stops a second add
-        if program.metadata is None:
-            program.metadata = {}
-        add_meta_cost_to_metadata(program.metadata, meta_cost, update_id)
         stored = await self.async_db.add_meta_cost_async(
             program.id, meta_cost, update_id
         )
         if stored is None:
             raise ValueError(f"The database does not hold program {program.id}")
-        # The database can hold the cost of other updates of the program
+        # Keep the program in memory in step with the database. A write of
+        # its full metadata keeps the meta cost of the database
+        if program.metadata is None:
+            program.metadata = {}
         program.metadata.update(stored)
-        # Count the cost here, thus an error or a time limit after the write,
-        # in the write of the output file for example, does not remove it
-        self.total_api_cost += meta_cost
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
     async def _write_meta_output(self) -> None:
@@ -748,57 +740,31 @@ class ShinkaEvolveRunner:
         except Exception as e:
             logger.error(f"❌ Failed to write the meta output file: {e}")
 
-    async def _take_stored_meta_update(self, program: Program) -> None:
-        """Put the pending meta update into the state when a program holds its cost.
-
-        The program of a cost write holds the cost of the update in memory
-        before the write. Thus when the cost writes of the update fail, a
-        later write of the full metadata of that program puts the cost into
-        the database. The setup and a completed job make that write. A cost
-        write that a time limit cut can also commit later, before the end of
-        the launch. Then the state takes the update, and the cost total counts
-        its cost, as after a cost write.
-        """
-        update_ids = (program.metadata or {}).get("meta_cost_update_ids")
-        if self.meta_summarizer is None or not update_ids:
-            return
-        async with self._meta_side_effect_lock:
-            update = self.meta_summarizer.pending_update
-            if update is None or update.update_id not in update_ids:
-                return
-            logger.info(
-                f"The metadata of program {program.id} holds the cost of the "
-                f"pending meta update {update.update_id}"
-            )
-            self.meta_summarizer.take_stored_update(update)
-            self.total_api_cost += update.cost
-            # Save meta state before the output file, so that a resume does not repeat the update
-            self._save_meta_state()
-            await self._write_meta_output()
-
     async def _take_late_meta_update(self) -> None:
-        """Write the pending meta update at the end of the launch.
+        """Take the late cost writes into the saved state at the end of the launch.
 
-        A time limit cuts a cost write in the event loop only: its worker
-        thread can commit after the time limit. The cleanup of the launch
-        waits for the writers of the database. Thus after the cleanup, the
-        database can hold the cost of the pending update: then the state takes
-        it. Else the output file holds the update, as on main, but the state
-        file does not, and a later launch makes the update again. An error
-        does not stop the end of the launch.
+        After a stop, the cost write of a meta update can be in progress. The
+        cleanup of the launch waits for the writers of the database: then the
+        cost write committed or failed. The saved state takes each update
+        whose cost the database holds, and the state file follows. A stop can
+        come before the load of the state, thus no other save comes here. An
+        error does not stop the end of the launch.
         """
-        if self.meta_summarizer is None or self.meta_summarizer.pending_update is None:
+        if self.meta_summarizer is None:
             return
         try:
-            for program in self.db.get_all_programs():
-                await self._take_stored_meta_update(program)
-            update = self.meta_summarizer.pending_update
-            if update is not None:
-                # The state file does not get the update: no save comes after
-                self.meta_summarizer.take_stored_update(update)
-                await self._write_meta_output()
+            await self.meta_summarizer.stop_cost_writes()
+            if not self.meta_summarizer.unsaved_updates:
+                return
+            stored_update_ids = {
+                update_id
+                for program in self.db.get_all_programs()
+                for update_id in (program.metadata or {}).get("meta_cost_update_ids")
+                or []
+            }
+            self.meta_summarizer.take_stored_updates(stored_update_ids)
         except Exception as e:
-            logger.error(f"❌ Error in the late take of the pending meta update: {e}")
+            logger.error(f"❌ Error in the late take of the meta updates: {e}")
 
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
@@ -833,17 +799,17 @@ class ShinkaEvolveRunner:
                 best_program or self.meta_summarizer.evaluated_since_last_meta[-1]
             )
             # The final summary does what a resume needs: one update of all
-            # waiting programs, the state, the output file, and the cost in
-            # the database
-            await asyncio.wait_for(
+            # waiting programs, its output file, and its cost write
+            success, meta_cost = await asyncio.wait_for(
                 self.meta_summarizer.perform_final_summary_async(
                     str(self.results_dir),
                     best_program,
                     partial(self._store_meta_cost, cost_program),
-                    self._meta_state_path(),
                 ),
                 timeout=META_SUMMARY_TIMEOUT,
             )
+            if success and meta_cost > 0:
+                self.total_api_cost += meta_cost
         except asyncio.TimeoutError:
             logger.warning(
                 "⚠️  Meta update of the resume timed out, "
@@ -1337,10 +1303,11 @@ class ShinkaEvolveRunner:
                                     str(self.results_dir),
                                     best_program,
                                     partial(self._store_meta_cost, best_program),
-                                    self._meta_state_path(),
                                 ),
                                 timeout=META_SUMMARY_TIMEOUT,
                             )
+                            if success and final_meta_cost > 0:
+                                self.total_api_cost += final_meta_cost
                             if self.verbose:
                                 if success and final_meta_cost > 0:
                                     logger.info(
@@ -1366,7 +1333,9 @@ class ShinkaEvolveRunner:
             # Small delay to ensure all final operations are fully complete
             await asyncio.sleep(0.5)
 
-            # Save final meta state
+            # Save final meta state, after the cost writes of the meta updates
+            if self.meta_summarizer:
+                await self.meta_summarizer.wait_for_cost_writes(META_SUMMARY_TIMEOUT)
             self._save_meta_state()
 
             # Save final bandit state
@@ -2010,13 +1979,15 @@ class ShinkaEvolveRunner:
                     best_program, partial(self._store_meta_cost, initial_program)
                 )
                 if updated_recs:
+                    # Write meta output file asynchronously
+                    await self._write_meta_output()
+                    # Store meta cost for tracking
                     if meta_cost > 0:
                         logger.info(
                             f"Meta recommendation generation cost: ${meta_cost:.4f}"
                         )
-                    # Save meta state before the output file, so that a resume does not repeat the update
-                    self._save_meta_state()
-                    await self._write_meta_output()
+                        # Add meta cost to in-memory total for accurate budget tracking
+                        self.total_api_cost += meta_cost
 
         # Set baseline score for LLM selection
         if self.llm_selection is not None:
@@ -2042,7 +2013,6 @@ class ShinkaEvolveRunner:
             postprocess_finished_at=postprocess_finished_at,
         )
         await self._persist_program_metadata_async(initial_program)
-        await self._take_stored_meta_update(initial_program)
         self._log_program_to_wandb(initial_program)
 
         if self.verbose:
@@ -4667,17 +4637,15 @@ class ShinkaEvolveRunner:
                                 best_program, partial(self._store_meta_cost, program)
                             )
                             if updated_recs:
+                                # Write meta output file asynchronously
+                                await self._write_meta_output()
                                 if meta_cost > 0:
                                     logger.info(
                                         f"Meta recommendation cost: ${meta_cost:.4f}"
                                     )
+                                    # Add meta cost to in-memory total for accurate budget tracking
+                                    self.total_api_cost += meta_cost
                                     metadata_persist_needed = True
-                                # Save meta state before the output file, so that a resume does not repeat the update
-                                self._save_meta_state()
-                                # Write meta output file asynchronously
-                                await self.meta_summarizer.write_meta_output_async(
-                                    str(self.results_dir)
-                                )
                 except Exception as e:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")
                     # Don't fail the whole job for meta summarizer issues
@@ -4770,7 +4738,6 @@ class ShinkaEvolveRunner:
             if metadata_persist_needed:
                 try:
                     await self._persist_program_metadata_async(program)
-                    await self._take_stored_meta_update(program)
                 except Exception as e:
                     logger.warning(
                         f"Apply-stage metadata persistence error for {job.job_id}: {e}"

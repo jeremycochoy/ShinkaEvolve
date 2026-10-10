@@ -4,10 +4,11 @@ Provides non-blocking meta summarization with concurrent LLM calls.
 """
 
 import asyncio
+import copy
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Set, Tuple
 from pathlib import Path
 from .summarizer import MetaSummarizer
 from ..llm import AsyncLLMClient
@@ -24,43 +25,93 @@ from ..prompts import (
 
 logger = logging.getLogger(__name__)
 
-# Tries of the cost write of a meta update in one call, and the seconds between
-# 2 tries
+# Tries of the cost write of a meta update, and the seconds between 2 tries
 META_COST_WRITE_TRIES = 3
 META_COST_WRITE_RETRY_DELAY = 1.0
 
 
 @dataclass
 class MetaUpdate:
-    """The result and the cost of a meta update, before the state takes it."""
+    """The result and the cost of a meta update."""
 
     update_id: str
-    program_ids: List[str]
+    programs: List[Program]
     individual_summaries: str
     global_insights: str
     recommendations: str
     cost: float
-    store_cost: Optional[Callable[[float, str], Awaitable[None]]]
+
+
+def apply_meta_update(state: MetaSummarizer, update: MetaUpdate) -> None:
+    """Put the result of a meta update into a meta state."""
+    # Concatenate new individual summaries to existing ones
+    if state.meta_summary:
+        state.meta_summary += "\n\n" + update.individual_summaries
+    else:
+        state.meta_summary = update.individual_summaries
+
+    state.meta_scratch_pad = update.global_insights
+    state.meta_recommendations = update.recommendations
+
+    # Store the newly generated recommendations in history immediately
+    if update.recommendations and isinstance(update.recommendations, str):
+        state.meta_recommendations_history.append(update.recommendations)
+
+    # Remove only the summarized programs from the evaluated programs list
+    # A program with no step 1 answer stays there, and the next meta
+    # update tries it again
+    program_ids = [p.id for p in update.programs]
+    state.total_programs_processed += len(program_ids)
+    state.processed_program_ids.extend(program_ids)
+    state.evaluated_since_last_meta = [
+        p for p in state.evaluated_since_last_meta if p.id not in program_ids
+    ]
+
+
+def copy_meta_state(state: MetaSummarizer) -> MetaSummarizer:
+    """Copy a meta state, with an empty waiting list."""
+    copied = copy.copy(state)
+    copied.meta_recommendations_history = list(state.meta_recommendations_history)
+    copied.processed_program_ids = list(state.processed_program_ids)
+    copied.evaluated_since_last_meta = []
+    return copied
 
 
 class AsyncMetaSummarizer:
-    """Async version of MetaSummarizer for concurrent meta-analysis."""
+    """Async version of MetaSummarizer for concurrent meta-analysis.
+
+    As on main, the state in memory takes the result of a meta update after
+    its step 3. Then a task writes the cost of the update to the database. A
+    save of the state holds an update only when the database holds its cost.
+    """
 
     def __init__(
         self,
         sync_summarizer: MetaSummarizer,
         async_llm_client: Optional[AsyncLLMClient] = None,
+        state_path: Optional[str] = None,
     ):
         """Initialize with existing sync summarizer.
 
         Args:
             sync_summarizer: The synchronous MetaSummarizer instance
             async_llm_client: Optional async LLM client for meta analysis
+            state_path: Optional file that gets the saved state after each
+                cost write of a meta update
         """
         self.sync_summarizer = sync_summarizer
         self.async_llm_client = async_llm_client
-        # A meta update whose cost write failed: it waits for that write
-        self.pending_update: Optional[MetaUpdate] = None
+        self.state_path = state_path
+        # The updates of the state in memory whose cost the database does not
+        # hold: their cost write is in progress, or it failed. In the order
+        # of the updates
+        self.unsaved_updates: List[MetaUpdate] = []
+        # With unsaved updates, the state that a save writes: the state from
+        # before the first unsaved update, and each later update whose cost
+        # the database holds
+        self.saved_state = copy_meta_state(sync_summarizer)
+        # The task of each cost write of a meta update
+        self.cost_writes: List[asyncio.Task] = []
 
     async def update_meta_memory_async(
         self,
@@ -71,21 +122,15 @@ class AsyncMetaSummarizer:
         Async version of update_meta_memory.
         Perform 3-step meta-analysis and update internal state.
         A program with no step 1 answer stays in the waiting list.
-        With store_cost, the update writes its cost before its result goes
-        into the state. When each try of that write fails, the update keeps
-        its result and its cost, and the next call writes the cost again
-        with no new LLM query. A time limit or a cancel in the write also
-        keeps the update.
+        With store_cost, a task writes the cost of the update after the
+        update, and the caller does not wait for it. The cost writes run one
+        at a time, in the order of the updates.
         Returns tuple of (updated_recommendations, total_cost) or
         (None, 0.0) if no update occurred.
         """
         if not self.async_llm_client:
             logger.warning("No async meta LLM client configured")
             return None, 0.0
-
-        if self.pending_update is not None:
-            logger.info("Writing the cost of the pending meta update again...")
-            return await self._take_update(self.pending_update)
 
         # Use recently evaluated programs for memory scratchpad
         # Make a copy to avoid issues if the list is modified during processing
@@ -141,70 +186,28 @@ class AsyncMetaSummarizer:
             logger.error(f"Failed to complete 3-step meta-analysis: {e}")
             return None, total_meta_cost
 
-        self.pending_update = MetaUpdate(
+        update = MetaUpdate(
             update_id=uuid.uuid4().hex,
-            program_ids=[p.id for p in summarized_programs],
+            programs=summarized_programs,
             individual_summaries=individual_summaries,
             global_insights=global_insights,
             recommendations=recommendations,
             cost=total_meta_cost,
-            store_cost=store_cost,
         )
-        return await self._take_update(self.pending_update)
-
-    async def _take_update(self, update: MetaUpdate) -> Tuple[Optional[str], float]:
-        """Write the cost of an update, then put its result into the state.
-
-        Write the cost before the result goes into the state: no save of the
-        state then holds an update with no cost in the database.
-        """
-        if not await self._write_update_cost(update):
-            return None, 0.0
-        return self.take_stored_update(update)
-
-    def take_stored_update(self, update: MetaUpdate) -> Tuple[Optional[str], float]:
-        """Put an update into the state when the database holds its cost.
-
-        Returns the recommendations and the cost of the update.
-        """
-        self.pending_update = None
+        # A save keeps the state from before the update until the database
+        # holds the cost of the update
+        if not self.unsaved_updates:
+            self.saved_state = copy_meta_state(self.sync_summarizer)
+        self.unsaved_updates.append(update)
 
         # Update internal state of sync summarizer
-        # Concatenate new individual summaries to existing ones
-        if self.sync_summarizer.meta_summary:
-            self.sync_summarizer.meta_summary += "\n\n" + update.individual_summaries
-        else:
-            self.sync_summarizer.meta_summary = update.individual_summaries
-
-        self.sync_summarizer.meta_scratch_pad = update.global_insights
-        self.sync_summarizer.meta_recommendations = update.recommendations
-
-        # Store the newly generated recommendations in history immediately
-        if update.recommendations and isinstance(update.recommendations, str):
-            self.sync_summarizer.meta_recommendations_history.append(
-                update.recommendations
-            )
-            logger.debug(
-                f"Added new recommendations to history "
-                f"(total: {len(self.sync_summarizer.meta_recommendations_history)})"
-            )
-
-        # Remove only the summarized programs from the evaluated programs list
-        # A program with no step 1 answer stays there, and the next meta
-        # update tries it again
-        num_processed = len(update.program_ids)
-        self.sync_summarizer.total_programs_processed += num_processed
-        self.sync_summarizer.processed_program_ids.extend(update.program_ids)
-        self.sync_summarizer.evaluated_since_last_meta = [
-            p
-            for p in self.sync_summarizer.evaluated_since_last_meta
-            if p.id not in update.program_ids
-        ]
+        apply_meta_update(self.sync_summarizer, update)
         logger.info(
-            f"Processed and cleared {num_processed} programs from meta memory "
+            f"Processed and cleared {len(update.programs)} programs from meta memory "
             f"(total processed: {self.sync_summarizer.total_programs_processed}, "
             f"waiting: {len(self.sync_summarizer.evaluated_since_last_meta)})"
         )
+        self._queue_cost_write(update, store_cost)
 
         return (
             (
@@ -212,18 +215,53 @@ class AsyncMetaSummarizer:
                 if isinstance(self.sync_summarizer.meta_recommendations, str)
                 else None
             ),
-            update.cost,
+            total_meta_cost,
         )
 
-    async def _write_update_cost(self, update: MetaUpdate) -> bool:
+    def _queue_cost_write(
+        self,
+        update: MetaUpdate,
+        store_cost: Optional[Callable[[float, str], Awaitable[None]]],
+    ) -> None:
+        """Start the task that writes the cost of an update to the database."""
+        self.cost_writes = [task for task in self.cost_writes if not task.done()]
+        previous = self.cost_writes[-1] if self.cost_writes else None
+        self.cost_writes.append(
+            asyncio.create_task(self._write_update_cost(update, store_cost, previous))
+        )
+
+    async def _write_update_cost(
+        self,
+        update: MetaUpdate,
+        store_cost: Optional[Callable[[float, str], Awaitable[None]]],
+        previous: Optional[asyncio.Task],
+    ) -> None:
+        """Write the cost of an update, then put the update into the saved state.
+
+        The task waits for the cost write of the update before it, thus the
+        saved state takes the updates in their order. When each try fails, no
+        save holds the update, and a later launch makes the update again.
+        """
+        if previous is not None:
+            await asyncio.wait([previous])
+        if (
+            store_cost is not None
+            and update.cost > 0
+            and not await self._try_cost_write(update, store_cost)
+        ):
+            return
+        self._store_update(update)
+
+    async def _try_cost_write(
+        self,
+        update: MetaUpdate,
+        store_cost: Callable[[float, str], Awaitable[None]],
+    ) -> bool:
         """Write the cost of an update. Return False when each try fails.
 
         Each try has the same update id, thus the database adds the cost one
-        time, also when an earlier try commits after a time limit.
+        time, also when a try commits and then fails.
         """
-        store_cost = update.store_cost
-        if store_cost is None or update.cost <= 0:
-            return True
         for attempt in range(1, META_COST_WRITE_TRIES + 1):
             try:
                 await store_cost(update.cost, update.update_id)
@@ -236,10 +274,44 @@ class AsyncMetaSummarizer:
             if attempt < META_COST_WRITE_TRIES:
                 await asyncio.sleep(META_COST_WRITE_RETRY_DELAY)
         logger.error(
-            f"Meta update {update.update_id} keeps its result, "
-            f"and the next update writes its cost again"
+            f"The database holds no cost of meta update {update.update_id}: "
+            f"no save of the meta state holds the update"
         )
         return False
+
+    def _store_update(self, update: MetaUpdate) -> None:
+        """Put an update into the saved state when the database holds its cost.
+
+        Then save the state to the state file.
+        """
+        self.unsaved_updates.remove(update)
+        apply_meta_update(self.saved_state, update)
+        if self.state_path:
+            self.save_meta_state(self.state_path)
+
+    def take_stored_updates(self, stored_update_ids: Set[str]) -> None:
+        """Put each unsaved update whose cost the database holds into the saved state.
+
+        A stop can cut a cost write after its commit. An update with no cost
+        has no cost write.
+        """
+        for update in list(self.unsaved_updates):
+            if update.cost <= 0 or update.update_id in stored_update_ids:
+                self._store_update(update)
+
+    async def wait_for_cost_writes(self, timeout: Optional[float] = None) -> None:
+        """Wait for the cost writes of the meta updates, up to timeout seconds."""
+        pending = [task for task in self.cost_writes if not task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+
+    async def stop_cost_writes(self) -> None:
+        """Stop the cost writes that did not end, and wait for their end."""
+        pending = [task for task in self.cost_writes if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
 
     async def _step1_individual_summaries_async(
         self, programs_to_analyze: List[Program]
@@ -395,14 +467,11 @@ class AsyncMetaSummarizer:
         results_dir: str,
         best_program: Optional[Program] = None,
         store_cost: Optional[Callable[[float, str], Awaitable[None]]] = None,
-        state_path: Optional[str] = None,
     ) -> tuple[bool, float]:
         """Async version of perform_final_summary.
 
-        With store_cost, the update writes its cost to the database first.
-        Then its result goes into the state. With a state_path, the state then
-        goes to that file, before the output file. Thus the database holds the
-        cost of each update of the state, in memory and in the file.
+        With store_cost, a task writes the cost of the update to the database
+        after the update. An error of the output file goes to the log.
 
         Returns:
             Tuple of (success, meta_cost)
@@ -421,31 +490,19 @@ class AsyncMetaSummarizer:
             f"remaining programs..."
         )
 
-        # A pending update holds only its own programs. Then one more update
-        # takes the programs that came after it
-        updates, total_cost = 0, 0.0
-        while self.sync_summarizer.evaluated_since_last_meta:
-            takes_a_pending_update = self.pending_update is not None
-            updated_recs, meta_cost = await self.update_meta_memory_async(
-                best_program, store_cost
-            )
-            if not updated_recs:
-                break
+        updated_recs, meta_cost = await self.update_meta_memory_async(
+            best_program, store_cost
+        )
+        if updated_recs:
+            try:
+                await self.write_meta_output_async(results_dir)
+            except Exception as e:
+                logger.error(f"❌ Failed to write the meta output file: {e}")
             logger.info(f"Final meta summary completed (cost: ${meta_cost:.4f})")
-            updates, total_cost = updates + 1, total_cost + meta_cost
-
-            # Save the state after the cost, and before the output file, so
-            # that a resume does not repeat the update
-            if state_path:
-                self.save_meta_state(state_path)
-            await self.write_meta_output_async(results_dir)
-            if not takes_a_pending_update:
-                break
-
-        if updates == 0:
+            return True, meta_cost
+        else:
             logger.warning("Final meta summary failed to generate recommendations")
             return False, 0.0
-        return True, total_cost
 
     async def write_meta_output_async(self, results_dir: str) -> None:
         """Async version of write_meta_output - write files in thread pool."""
@@ -526,8 +583,18 @@ class AsyncMetaSummarizer:
         return self.sync_summarizer.get_sampled_recommendation()
 
     def save_meta_state(self, filepath: str) -> None:
-        """Save the meta state to a file (delegated to sync)."""
-        return self.sync_summarizer.save_meta_state(filepath)
+        """Save the meta state to a file (delegated to sync).
+
+        The file holds each update whose cost the database holds, and no
+        other. The programs of an unsaved update wait in the file.
+        """
+        if not self.unsaved_updates:
+            return self.sync_summarizer.save_meta_state(filepath)
+        unsaved_programs = [p for u in self.unsaved_updates for p in u.programs]
+        self.saved_state.evaluated_since_last_meta = (
+            unsaved_programs + self.sync_summarizer.evaluated_since_last_meta
+        )
+        return self.saved_state.save_meta_state(filepath)
 
     def load_meta_state(self, filepath: str) -> bool:
         """Load the meta state from a file (delegated to sync)."""
