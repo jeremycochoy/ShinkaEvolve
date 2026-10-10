@@ -200,7 +200,8 @@ def make_runner(
         generation = int(re.search(r"(\d+)$", str(job_id)).group(1))
         return NAN_RESULTS if generation in nan_generations else EVAL_RESULTS
 
-    runner.scheduler.run = lambda exec_fname, results_dir: (EVAL_RESULTS, 0.0)
+    initial_results = NAN_RESULTS if 0 in nan_generations else EVAL_RESULTS
+    runner.scheduler.run = lambda exec_fname, results_dir: (initial_results, 0.0)
     runner.scheduler.get_job_results_async = get_job_results
     if meta_llm:
         runner.meta_summarizer.async_llm_client = meta_llm
@@ -1153,6 +1154,26 @@ def test_resume_starts_when_the_write_of_the_missing_output_file_fails(
     # The next resume writes the output file of the last update.
     launch(run_dir, StubMetaLLM("launch 3"), generations=[])
     assert meta_files(run_dir) == ["meta_4.txt"]
+
+
+def test_resume_with_no_correct_program_keeps_the_cost_of_its_update(tmp_path):
+    run_dir = tmp_path / "run"
+    # No program of the search is correct, thus the database has no best program.
+    launch(run_dir, None, generations=[1], nan_generations={0, 1})
+
+    # A full interval waits at the resume.
+    meta_llm = StubMetaLLM("launch 2")
+    second = launch(run_dir, meta_llm, [2], meta_rec_interval=2, nan_generations={2})
+    third = launch(run_dir, StubMetaLLM("launch 3"), [], meta_rec_interval=2)
+
+    # The cost total of the next launch holds each paid update.
+    assert third.api_cost == pytest.approx(update_costs(meta_llm.batches))
+    # The update of a resume writes its cost to the best program, thus this
+    # resume makes no update. The job of generation 2 makes the update, and
+    # its cost goes to the program of the job.
+    assert second.updates == 0
+    assert second.first_recommendation is None
+    assert meta_llm.batches == [[0, 1, 2]]
 
 
 def test_resume_starts_when_its_update_gives_an_error(tmp_path, monkeypatch):

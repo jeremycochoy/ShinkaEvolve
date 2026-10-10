@@ -700,6 +700,13 @@ class ShinkaEvolveRunner:
         logger.info("Updating meta memory before the first proposal of the resume...")
         try:
             best_program = await self.async_db.get_best_program_async()
+            if best_program is None:
+                # The update writes its cost to the best program. With no best
+                # program, the programs wait for the update of a completed job
+                logger.warning(
+                    "No best program found for the meta update of the resume"
+                )
+                return
             # The final summary does what a resume needs: one update of all
             # waiting programs, the state, the output file, and the cost in
             # the database
