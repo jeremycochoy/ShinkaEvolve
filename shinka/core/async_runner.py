@@ -736,6 +736,33 @@ class ShinkaEvolveRunner:
         self.total_api_cost += meta_cost
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
 
+    async def _take_stored_meta_update(self, program: Program) -> None:
+        """Put the pending meta update into the state after a metadata write.
+
+        The program of a cost write holds the cost of the update in memory
+        before the write. Thus when the cost writes of the update fail, a
+        later write of the full metadata of that program puts the cost into
+        the database. The setup and a completed job make that write. Then the
+        state takes the update, and the cost total counts its cost, as after a
+        cost write.
+        """
+        update_ids = (program.metadata or {}).get("meta_cost_update_ids")
+        if self.meta_summarizer is None or not update_ids:
+            return
+        async with self._meta_side_effect_lock:
+            update = self.meta_summarizer.pending_update
+            if update is None or update.update_id not in update_ids:
+                return
+            logger.info(
+                f"The metadata of program {program.id} holds the cost of the "
+                f"pending meta update {update.update_id}"
+            )
+            self.meta_summarizer.take_stored_update(update)
+            self.total_api_cost += update.cost
+            # Save meta state before the output file, so that a resume does not repeat the update
+            self._save_meta_state()
+            await self.meta_summarizer.write_meta_output_async(str(self.results_dir))
+
     async def _summarize_waiting_programs(self) -> None:
         """Run the meta update that is due, before the first proposal of a resume.
 
@@ -1967,6 +1994,7 @@ class ShinkaEvolveRunner:
             postprocess_finished_at=postprocess_finished_at,
         )
         await self._persist_program_metadata_async(initial_program)
+        await self._take_stored_meta_update(initial_program)
         self._log_program_to_wandb(initial_program)
 
         if self.verbose:
@@ -4694,6 +4722,7 @@ class ShinkaEvolveRunner:
             if metadata_persist_needed:
                 try:
                     await self._persist_program_metadata_async(program)
+                    await self._take_stored_meta_update(program)
                 except Exception as e:
                     logger.warning(
                         f"Apply-stage metadata persistence error for {job.job_id}: {e}"

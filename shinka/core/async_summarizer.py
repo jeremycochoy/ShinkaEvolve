@@ -160,6 +160,13 @@ class AsyncMetaSummarizer:
         """
         if not await self._write_update_cost(update):
             return None, 0.0
+        return self.take_stored_update(update)
+
+    def take_stored_update(self, update: MetaUpdate) -> Tuple[Optional[str], float]:
+        """Put an update into the state when the database holds its cost.
+
+        Returns the recommendations and the cost of the update.
+        """
         self.pending_update = None
 
         # Update internal state of sync summarizer

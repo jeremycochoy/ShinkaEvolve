@@ -39,9 +39,12 @@ All notable changes to `shinka-evolve` are documented in this file.
   database, as the other writes of a program do. When that write fails, the
   update keeps its result and its cost, and it writes the cost again with no
   new LLM query. The database adds the cost of an update one time, so a write
-  that a time limit cut can commit late with no second count. The cost total
-  of a launch counts the cost of an update when its write commits, so a later
-  error, for example in the write of the output file, does not remove it.
+  that a time limit cut can commit late with no second count. The setup and a
+  completed job then write the full metadata of their program, which holds
+  that cost: after that write, the state takes the update, as on `main`. The
+  cost total of a launch counts the cost of an update when its write commits,
+  so a later error, for example in the write of the output file, does not
+  remove it.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program
