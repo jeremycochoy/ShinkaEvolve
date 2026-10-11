@@ -2297,8 +2297,32 @@ def test_cost_write_to_a_program_that_the_database_does_not_hold(tmp_path):
     assert waiting_generations(state) == [0, 1]
 
 
+def write_the_output_file_after_the_stop(patch) -> None:
+    """Make the output file write of a meta update end after the stop of the launch.
+
+    The caller of the update waits for that write until the stop reaches it.
+    Then the write runs, as a write in progress on main ends after a stop,
+    and the stop continues. A real write can end before the stop reaches the
+    caller. Then on Python 3.10 and 3.11, asyncio.wait_for() gives the result
+    of the final summary or of the update of a resume, and the launch
+    continues to its end.
+    """
+    write_meta_output_async = AsyncMetaSummarizer.write_meta_output_async
+
+    async def write_after_the_stop(self, results_dir):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await write_meta_output_async(self, results_dir)
+            raise
+
+    patch.setattr(AsyncMetaSummarizer, "write_meta_output_async", write_after_the_stop)
+
+
 @pytest.mark.parametrize("path", ["completed job", "resume", "final summary"])
-def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(tmp_path, path):
+def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(
+    tmp_path, monkeypatch, path
+):
     run_dir = tmp_path / "run"
     interval, num_generations = UPDATE_PATHS[path]
     if path == "resume":
@@ -2306,19 +2330,25 @@ def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(tmp_path, path
         launch(run_dir, None, generations=[1])
     # Launch 1 stops as a stop of the process does, at the start of the cost
     # write of its first update: after step 3, before the commit of the cost.
+    # At that time, the update waits for the write of its output file.
     first_llm = StubMetaLLM("launch 1")
-    prompts = search(
-        run_dir,
-        first_llm,
-        interval,
-        num_generations,
-        stop_at=("_store_meta_cost", 1),
-    )
+    with monkeypatch.context() as patch:
+        write_the_output_file_after_the_stop(patch)
+        prompts = search(
+            run_dir,
+            first_llm,
+            interval,
+            num_generations,
+            stop_at=("_store_meta_cost", 1),
+        )
     assert first_llm.batches == [[0, 1]]
     stored = 0.01 * len(prompts)
 
-    # The stop can cut the write of the output file of the update, as on main.
-    assert meta_files(run_dir) in ([], ["meta_2.txt"])
+    # As a write in progress on main, the write of the output file of the
+    # update ends after the stop.
+    assert meta_files(run_dir) == ["meta_2.txt"]
+    output = (run_dir / "meta" / "meta_2.txt").read_text(encoding="utf-8")
+    assert "1. Recommendation of launch 1 update 1." in output
     # The database holds no cost of the update, thus no state file holds it.
     assert stored_meta_costs(run_dir) == 0
     assert read_state(run_dir) is None
