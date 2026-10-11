@@ -39,12 +39,15 @@ All notable changes to `shinka-evolve` are documented in this file.
   an update only when the database holds its cost: until that write, a save
   writes the state from before the update, and a later launch makes the update
   again when the write fails or the process stops. A full metadata write of a
-  program keeps the meta cost of the database. An error in the write of an
-  output file no longer stops the setup: the runner logs it. A resume with no
-  correct program also makes the update that is due, and writes its cost to a
-  waiting program. With no generation left or the cost budget used, that
-  update runs whatever the interval, because the final summary needs a
-  correct program.
+  program keeps the meta cost of the database. As before, the final W&B table
+  and the final console summary hold the cost of each update of the setup and
+  of the jobs of the run, also when its write fails or ends late: they merge
+  that cost with the costs of the database by update id. An error in the
+  write of an output file no longer stops the setup: the runner logs it. A
+  resume with no correct program also makes the update that is due, and writes
+  its cost to a waiting program. With no generation left or the cost budget
+  used, that update runs whatever the interval, because the final summary
+  needs a correct program.
 - Fixed step 1 of the async meta update to make one query for each program, so
   each summary keeps the identifier of its program. Before, a failed answer
   gave the later summaries the identifier of another program, and its program

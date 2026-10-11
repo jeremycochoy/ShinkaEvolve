@@ -150,6 +150,24 @@ def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
 META_COST_FIELDS = ("meta_cost", "meta_cost_update_ids")
 
 
+def meta_cost_with_live_costs(
+    metadata: Dict[str, Any], live_costs: Dict[str, float]
+) -> float:
+    """Give the meta cost of a program: its cost in the database, plus its live costs.
+
+    live_costs gives the cost of each meta update of the launch that goes to
+    the program, by update id. The cost write of an update can fail or end
+    late. A live cost adds to the cost of the database only when the database
+    does not hold its update id, thus each cost counts one time.
+    """
+    stored_update_ids = set(metadata.get("meta_cost_update_ids") or [])
+    return float(metadata.get("meta_cost") or 0.0) + sum(
+        cost
+        for update_id, cost in live_costs.items()
+        if update_id not in stored_update_ids
+    )
+
+
 @dataclass
 class Program:
     """Represents a program in the database"""
@@ -2489,8 +2507,17 @@ class ProgramDatabase:
                 )
             logger.info(log_msg)
 
-    def print_summary(self, console=None, total_program_target: Optional[int] = None) -> None:
-        """Print a summary of the database contents using DatabaseDisplay."""
+    def print_summary(
+        self,
+        console=None,
+        total_program_target: Optional[int] = None,
+        live_meta_costs: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> None:
+        """Print a summary of the database contents using DatabaseDisplay.
+
+        live_meta_costs gives the live meta costs of each program, by program
+        id (see meta_cost_with_live_costs()).
+        """
         if not hasattr(self, "_database_display"):
             self._database_display = DatabaseDisplay(
                 cursor=self.cursor,
@@ -2508,6 +2535,7 @@ class ProgramDatabase:
         self._database_display.print_summary(
             console,
             total_program_target=total_program_target,
+            live_meta_costs=live_meta_costs,
         )
 
     def _print_program_summary(self, program) -> None:

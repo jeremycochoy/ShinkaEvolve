@@ -112,6 +112,9 @@ class AsyncMetaSummarizer:
         self.saved_state = copy_meta_state(sync_summarizer)
         # The task of each cost write of a meta update
         self.cost_writes: List[asyncio.Task] = []
+        # The last update that the state in memory took. A caller reads it
+        # when update_meta_memory_async() gives recommendations
+        self.last_update: Optional[MetaUpdate] = None
 
     async def update_meta_memory_async(
         self,
@@ -199,6 +202,7 @@ class AsyncMetaSummarizer:
         if not self.unsaved_updates:
             self.saved_state = copy_meta_state(self.sync_summarizer)
         self.unsaved_updates.append(update)
+        self.last_update = update
 
         # Update internal state of sync summarizer
         apply_meta_update(self.sync_summarizer, update)

@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -25,6 +26,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+from rich.console import Console
 
 from shinka.core import (
     EvolutionConfig,
@@ -37,6 +39,7 @@ from shinka.core.async_summarizer import AsyncMetaSummarizer
 from shinka.core.summarizer import MetaSummarizer
 from shinka.database import DatabaseConfig, Program, ProgramDatabase
 from shinka.database.async_dbase import AsyncProgramDatabase
+from shinka.database.dbase import meta_cost_with_live_costs
 from shinka.launch import LocalJobConfig
 from shinka.pricing.catalog import PricingConfig, PricingMode, refresh_model_catalog
 from shinka.prompts import (
@@ -1255,12 +1258,271 @@ def test_wandb_gets_the_cost_of_an_update_whose_cost_write_tries_again(
         "1. Recommendation of launch 1 update 1."
     ]
     assert waiting_generations(state) == []
-    # The final table and the summary of W&B read the database and the cost
-    # total: each holds the cost one time.
+    # The final table merges the cost of the update with the costs of the
+    # database by update id, and the summary of W&B reads the cost total: each
+    # holds the cost one time.
     table = run.payloads[-1][PROGRAM_TABLE_KEY]
     assert sum(row[-1] for row in table.data) == pytest.approx(paid)
     assert run.summary["run/total_api_cost"] == pytest.approx(paid)
     assert result.final_api_cost == pytest.approx(paid)
+
+
+def record_final_console_summaries(patch) -> list[str]:
+    """Record the final console summary of each launch.
+
+    The runners of the tests have no verbose output, thus they print no final
+    summary. Here each launch prints its final summary to a console that
+    records it. Returns the text of each final summary.
+    """
+    texts: list[str] = []
+    print_final_summary = ShinkaEvolveRunner._print_final_summary
+
+    async def print_and_record(self):
+        self.verbose, self.console = True, Console(record=True, width=200)
+        await print_final_summary(self)
+        texts.append(self.console.export_text())
+
+    patch.setattr(ShinkaEvolveRunner, "_print_final_summary", print_and_record)
+    return texts
+
+
+def console_costs(text: str) -> dict[str, float]:
+    """Give each total of the cost table of a final console summary, by name."""
+    return {
+        name: float(value)
+        for name, value in re.findall(r"(Total \w+ Cost)\s*│\s*\$([\d.]+)", text)
+    }
+
+
+def final_table_meta_costs(run: FakeWandbRun, run_dir: Path) -> dict[int, float]:
+    """Give the meta cost of each evaluated program in the last final W&B table.
+
+    A row of the table gives the sum of the costs of its program. The meta
+    cost is that sum less the other costs, which the database holds. The
+    result is by generation. As on main, an island copy has no meta cost.
+    """
+    tables = [p[PROGRAM_TABLE_KEY] for p in run.payloads if PROGRAM_TABLE_KEY in p]
+    row_costs = {row[0]: row[-1] for row in tables[-1].data}
+    config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
+    db = ProgramDatabase(config=config, embedding_model="", read_only=True)
+    try:
+        programs = db.get_all_programs()
+        evaluated_ids = {p.id for p in db.get_evaluated_programs()}
+    finally:
+        db.close()
+    assert set(row_costs) == {p.id for p in programs}
+    meta_costs = {}
+    for program in programs:
+        other_costs = sum(
+            program.metadata.get(key) or 0.0
+            for key in ("api_costs", "embed_cost", "novelty_cost")
+        )
+        meta_cost = round(row_costs[program.id] - other_costs, 6)
+        if program.id in evaluated_ids:
+            meta_costs[program.generation] = meta_cost
+        else:
+            assert meta_cost == 0, program.metadata
+    return meta_costs
+
+
+def stored_meta_costs_by_generation(run_dir: Path) -> dict[int, float]:
+    """Give the meta cost of each evaluated program of the database, by generation."""
+    config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
+    db = ProgramDatabase(config=config, embedding_model="", read_only=True)
+    try:
+        return {
+            p.generation: round(p.metadata.get("meta_cost") or 0.0, 6)
+            for p in db.get_evaluated_programs()
+        }
+    finally:
+        db.close()
+
+
+def record_final_summaries(patch) -> list[tuple[int, float]]:
+    """Record the generation of the best program and the cost of each final summary."""
+    final_summaries: list[tuple[int, float]] = []
+    summarize = AsyncMetaSummarizer.perform_final_summary_async
+
+    async def summarize_and_record(self, results_dir, best_program, store_cost):
+        success, meta_cost = await summarize(
+            self, results_dir, best_program, store_cost
+        )
+        if success:
+            final_summaries.append((best_program.generation, meta_cost))
+        return success, meta_cost
+
+    patch.setattr(
+        AsyncMetaSummarizer, "perform_final_summary_async", summarize_and_record
+    )
+    return final_summaries
+
+
+def pass_the_time_limit_then_fail(patch) -> list[bool]:
+    """Make each cost write wait until the final W&B table, then fail.
+
+    Thus each cost write passes the time limit of the wait for the cost writes
+    at the end of the launch, as when the database hangs. Returns, for each
+    cost write, whether the final table came before the end of its wait.
+    """
+    final_table_logged = threading.Event()
+    waits: list[bool] = []
+    log_final = ShinkaWandbLogger.log_final
+
+    def log_then_release(self, **kwargs):
+        log_final(self, **kwargs)
+        final_table_logged.set()
+
+    def wait_then_fail(db, *args):
+        waits.append(final_table_logged.wait(timeout=30))
+        raise sqlite3.OperationalError("database is locked")
+
+    patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 1.0)
+    patch.setattr(ShinkaWandbLogger, "log_final", log_then_release)
+    patch.setattr(ProgramDatabase, "add_meta_cost", wait_then_fail)
+    return waits
+
+
+def check_each_save(patch, run_dir: Path) -> list[list[str]]:
+    """Check each save of the state file of run_dir against the database.
+
+    Returns, for each save, the recommendation of each update of the save
+    whose cost the database does not hold.
+    """
+    update_ids: dict[str, str] = {}
+    queue_cost_write = AsyncMetaSummarizer._queue_cost_write
+
+    def record_then_queue(self, update, store_cost):
+        update_ids[update.recommendations] = update.update_id
+        return queue_cost_write(self, update, store_cost)
+
+    saves: list[list[str]] = []
+    save = MetaSummarizer.save_meta_state
+
+    def save_then_check(self, filepath):
+        save(self, filepath)
+        if Path(filepath) == run_dir / STATE_FILE:
+            stored = set(stored_update_ids(run_dir))
+            history = read_state(run_dir)["meta_recommendations_history"]
+            saves.append([text for text in history if update_ids[text] not in stored])
+
+    patch.setattr(AsyncMetaSummarizer, "_queue_cost_write", record_then_queue)
+    patch.setattr(MetaSummarizer, "save_meta_state", save_then_check)
+    return saves
+
+
+# The failure points of a cost write, for the final readers of the costs.
+FINAL_READER_FAILURES: dict[str, Callable[[Any], Any]] = {
+    "fails 1 time": partial(fail_the_first_cost_writes, count=1),
+    "fails 3 times": lambda patch: fail_the_first_cost_writes(
+        patch, async_summarizer.META_COST_WRITE_TRIES
+    ),
+    "is slow": commit_each_cost_write_late,
+    "passes the time limit": pass_the_time_limit_then_fail,
+}
+# What the final readers show after a fresh search with no failure point, by
+# interval.
+REFERENCE_FINAL_READERS: dict = {}
+
+
+def final_readers_of_a_search(run_dir, monkeypatch, interval, failure=None) -> dict:
+    """Run a fresh search of 3 generations, with the failure point of a cost write.
+
+    Return what the readers at the end of the launch show: the meta cost of
+    each program in the final W&B table, the totals of the final console
+    summary, and the cost total. Also return the generation of the program
+    and the cost of each final summary, the meta cost of each program in the
+    database, and the value that the failure point gave.
+    """
+    totals: list[float] = []
+    with monkeypatch.context() as patch:
+        run = record_wandb(patch)
+        texts = record_final_console_summaries(patch)
+        final_summaries = record_final_summaries(patch)
+        failure_point = FINAL_READER_FAILURES[failure](patch) if failure else None
+        search(run_dir, StubMetaLLM("launch 1"), interval, 3, totals=totals)
+    (text,) = texts
+    return {
+        "table": final_table_meta_costs(run, run_dir),
+        "console": console_costs(text),
+        "cost total": round(totals[-1], 6),
+        "final summaries": final_summaries,
+        "stored": stored_meta_costs_by_generation(run_dir),
+        "failure point": failure_point,
+    }
+
+
+def without_the_final_summary_cost(readers: dict) -> dict:
+    """Give the final table and the console totals with no cost of the final summary."""
+    table, console = dict(readers["table"]), dict(readers["console"])
+    for generation, meta_cost in readers["final summaries"]:
+        table[generation] = round(table[generation] - meta_cost, 6)
+        for name in ("Total Meta Cost", "Total Combined Cost"):
+            console[name] = round(console[name] - meta_cost, 2)
+    return {"table": table, "console": console}
+
+
+@pytest.mark.parametrize("path", FRESH_PATHS)
+@pytest.mark.parametrize("failure", FINAL_READER_FAILURES)
+def test_final_table_and_console_summary_are_as_on_main_then_two_resumes(
+    tmp_path, monkeypatch, failure, path
+):
+    run_dir = tmp_path / "run"
+    interval = FRESH_PATHS[path]
+    saves = check_each_save(monkeypatch, run_dir)
+    if interval not in REFERENCE_FINAL_READERS:
+        REFERENCE_FINAL_READERS[interval] = final_readers_of_a_search(
+            tmp_path / "reference", monkeypatch, interval
+        )
+    reference = REFERENCE_FINAL_READERS[interval]
+
+    result = final_readers_of_a_search(run_dir, monkeypatch, interval, failure)
+
+    # With no failure point, the database holds each cost, and the final
+    # table and the console summary hold each cost one time.
+    assert reference["table"] == reference["stored"]
+    assert reference["console"]["Total Meta Cost"] == pytest.approx(
+        sum(reference["stored"].values())
+    )
+    # main writes the cost of an update of the setup or of a job with the
+    # metadata of its program. Thus a cost write of that update changes no
+    # final table and no console summary of main. main writes the cost of its
+    # final summary with 1 try, inside the time limit of the final summary.
+    # Thus main loses that cost when the try fails or passes the time limit.
+    main = {"table": reference["table"], "console": reference["console"]}
+    final_summary_is_first = path == "final summary"
+    if failure == "passes the time limit" or (
+        final_summary_is_first and failure.startswith("fails")
+    ):
+        main = without_the_final_summary_cost(reference)
+    shown = {"table": result["table"], "console": result["console"]}
+    if final_summary_is_first and failure == "fails 1 time":
+        # Here the cost write tries again, and the database holds the cost.
+        assert shown != main
+        assert shown == {"table": reference["table"], "console": reference["console"]}
+    else:
+        assert shown == main
+    # As on main, the cost total counts each update. main does not count a
+    # final summary whose cost write passes its time limit.
+    assert result["cost total"] == reference["cost total"]
+    if failure == "passes the time limit":
+        assert result["failure point"] and all(result["failure point"])
+
+    # 2 resumes. Their final table and their console summary show the costs
+    # of the database: a resume completes no job.
+    for name in ("launch 2", "launch 3"):
+        with monkeypatch.context() as patch:
+            run = record_wandb(patch)
+            texts = record_final_console_summaries(patch)
+            launch(run_dir, StubMetaLLM(name), [], meta_rec_interval=interval)
+        stored = stored_meta_costs_by_generation(run_dir)
+        assert final_table_meta_costs(run, run_dir) == stored
+        assert console_costs(texts[-1])["Total Meta Cost"] == pytest.approx(
+            round(sum(stored.values()), 2)
+        )
+    # Each program got its summary. No save holds an update whose cost the
+    # database does not hold.
+    assert waiting_generations(read_state(run_dir)) == []
+    assert saves and not any(saves)
 
 
 def make_meta_program(generation: int) -> Program:
@@ -2751,6 +3013,17 @@ def test_add_meta_cost_adds_to_the_cost_in_the_database(tmp_path):
         db.add_meta_cost("gen-1", 0.04, "update-3")
     assert not db.conn.in_transaction
     db.close()
+
+
+def test_meta_cost_with_live_costs_counts_each_cost_one_time():
+    # The database holds the cost of update 1. The cost write of update 2
+    # failed, thus only the launch has that cost.
+    stored = {"meta_cost": 0.04, "meta_cost_update_ids": ["update-1"]}
+    live_costs = {"update-1": 0.04, "update-2": 0.08}
+
+    assert meta_cost_with_live_costs(stored, live_costs) == pytest.approx(0.12)
+    assert meta_cost_with_live_costs(stored, {}) == pytest.approx(0.04)
+    assert meta_cost_with_live_costs({}, live_costs) == pytest.approx(0.12)
 
 
 def test_two_cost_writes_at_the_same_time_keep_each_cost(tmp_path):

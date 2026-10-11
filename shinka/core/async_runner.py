@@ -47,7 +47,7 @@ from shinka.edit.async_apply import (
 from shinka.edit import summarize_diff
 from shinka.core.sampler import PromptSampler
 from shinka.core.summarizer import MetaSummarizer
-from shinka.core.async_summarizer import AsyncMetaSummarizer
+from shinka.core.async_summarizer import AsyncMetaSummarizer, MetaUpdate
 from shinka.core.async_novelty_judge import AsyncNoveltyJudge
 from shinka.core.novelty_judge import NoveltyJudge
 from shinka.core.config import EvolutionConfig, FOLDER_PREFIX
@@ -559,6 +559,9 @@ class ShinkaEvolveRunner:
         self.total_proposals_generated = 0
         self.total_api_cost = 0.0
         self.start_time = None
+        # The cost of each meta update of the setup and of the jobs of the
+        # launch, by program id, then by update id
+        self.live_meta_costs: Dict[str, Dict[str, float]] = {}
 
         # In-flight cost estimation for accurate budget enforcement
         self.completed_proposal_costs: List[
@@ -728,6 +731,19 @@ class ShinkaEvolveRunner:
             program.metadata = {}
         program.metadata.update(stored)
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
+
+    def _keep_live_meta_cost(self, program: Program, update: MetaUpdate) -> None:
+        """Keep the cost of the meta update that a program started.
+
+        As on main, the program holds that cost in memory. On main, the
+        metadata write of the program puts the cost into the database. Here
+        only the cost write of the update does, and that write can fail or end
+        late. Thus the final W&B table and the final console summary merge the
+        live costs with the costs of the database, by update id.
+        """
+        self.live_meta_costs.setdefault(program.id, {})[update.update_id] = (
+            update.cost
+        )
 
     async def _write_meta_output(self) -> None:
         """Write the output file of the last meta update.
@@ -1987,6 +2003,7 @@ class ShinkaEvolveRunner:
                     best_program, partial(self._store_meta_cost, initial_program)
                 )
                 if updated_recs:
+                    meta_update = self.meta_summarizer.last_update
                     # Write meta output file asynchronously
                     await self._write_meta_output()
                     # Store meta cost for tracking
@@ -2001,6 +2018,7 @@ class ShinkaEvolveRunner:
                         if initial_program.metadata is None:
                             initial_program.metadata = {}
                         initial_program.metadata["meta_cost"] = meta_cost
+                        self._keep_live_meta_cost(initial_program, meta_update)
 
         # Set baseline score for LLM selection
         if self.llm_selection is not None:
@@ -4650,6 +4668,7 @@ class ShinkaEvolveRunner:
                                 best_program, partial(self._store_meta_cost, program)
                             )
                             if updated_recs:
+                                meta_update = self.meta_summarizer.last_update
                                 # Write meta output file asynchronously
                                 await self._write_meta_output()
                                 if meta_cost > 0:
@@ -4663,6 +4682,7 @@ class ShinkaEvolveRunner:
                                     if program.metadata is None:
                                         program.metadata = {}
                                     program.metadata["meta_cost"] = meta_cost
+                                    self._keep_live_meta_cost(program, meta_update)
                                     metadata_persist_needed = True
                 except Exception as e:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")
@@ -5765,6 +5785,7 @@ class ShinkaEvolveRunner:
             db=getattr(self, "db", None),
             total_proposals_generated=getattr(self, "total_proposals_generated", None),
             total_api_cost=getattr(self, "total_api_cost", None),
+            live_meta_costs=getattr(self, "live_meta_costs", None),
         )
         wandb_logger.finish()
 
@@ -5832,6 +5853,7 @@ class ShinkaEvolveRunner:
             self.db.print_summary(
                 console=self.console,
                 total_program_target=self.evo_config.num_generations,
+                live_meta_costs=self.live_meta_costs,
             )
 
     def _log_timing_bottleneck_summary(self) -> None:

@@ -171,11 +171,19 @@ class DatabaseDisplay:
         self,
         console: Optional[RichConsole] = None,
         total_program_target: Optional[int] = None,
+        live_meta_costs: Optional[dict] = None,
     ) -> None:
-        """Print a summary of the database contents to the terminal."""
+        """Print a summary of the database contents to the terminal.
+
+        live_meta_costs gives the live meta costs of each program, by program
+        id. The total meta cost merges them with the costs of the database.
+        """
         if not self.cursor or not self.conn:
             logger.error("Database not connected. Cannot print summary.")
             return
+
+        # Import here to avoid circular imports
+        from .dbase import meta_cost_with_live_costs
 
         _console = console or self.default_console or RichConsole()
 
@@ -190,18 +198,23 @@ class DatabaseDisplay:
         num_with_scores = 0
         all_scores = []
         if self.cursor:  # Ensure cursor is not None
-            query = "SELECT metadata, combined_score, correct FROM programs"
+            query = "SELECT id, metadata, combined_score, correct FROM programs"
             self.cursor.execute(query)
             for row in self.cursor.fetchall():
                 if row["metadata"]:
                     metadata = json.loads(row["metadata"] or "{}")
+                    live_costs = (live_meta_costs or {}).get(row["id"])
                     if "api_costs" in metadata:
                         total_api_cost += float(metadata["api_costs"])
                     if "embed_cost" in metadata:
                         total_embed_cost += float(metadata["embed_cost"])
                     if "novelty_cost" in metadata:
                         total_novelty_cost += float(metadata["novelty_cost"])
-                    if "meta_cost" in metadata:
+                    if live_costs:
+                        total_meta_cost += meta_cost_with_live_costs(
+                            metadata, live_costs
+                        )
+                    elif "meta_cost" in metadata:
                         total_meta_cost += float(metadata["meta_cost"])
                     if "compute_time" in metadata:
                         total_compute_time += float(metadata["compute_time"])
