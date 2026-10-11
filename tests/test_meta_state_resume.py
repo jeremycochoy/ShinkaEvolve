@@ -198,13 +198,16 @@ def make_runner(
     nan_generations=(),
     max_db_workers: int = 2,
     max_api_costs: float | None = None,
+    scores: dict[int, float] | None = None,
+    db_options: dict | None = None,
 ) -> ShinkaEvolveRunner:
     """Build a runner on run_dir. Without a meta LLM, the meta summary is off.
 
-    The evaluation of each generation of nan_generations gives a NaN score.
+    The evaluation of each generation of nan_generations gives a NaN score,
+    and scores gives the score of a generation (1.0 by default).
     max_db_workers gives the count of workers of the write queue of the
     database (2 is the default of the runner). max_api_costs gives the cost
-    budget of the search.
+    budget of the search. db_options gives more fields of the database config.
     """
     init_path = run_dir.parent / "initial.py"
     init_path.write_text(PROGRAM.format(generation=0), encoding="utf-8")
@@ -224,19 +227,30 @@ def make_runner(
     runner = ShinkaEvolveRunner(
         evo_config,
         LocalJobConfig(),
-        DatabaseConfig(num_islands=2),
+        DatabaseConfig(**{"num_islands": 2, **(db_options or {})}),
         verbose=False,
         max_evaluation_jobs=1,
         max_db_workers=max_db_workers,
     )
+    score_of = scores or {}
+
+    def results_of(generation: int) -> dict:
+        if generation in nan_generations:
+            return NAN_RESULTS
+        if generation in score_of:
+            metrics = {
+                "combined_score": score_of[generation],
+                "public": {},
+                "private": {},
+            }
+            return {"correct": {"correct": True}, "metrics": metrics}
+        return EVAL_RESULTS
 
     async def get_job_results(job_id, results_dir):
         # The results directory of a job is <run_dir>/gen_<generation>/results.
-        generation = int(Path(results_dir).parent.name[4:])
-        return NAN_RESULTS if generation in nan_generations else EVAL_RESULTS
+        return results_of(int(Path(results_dir).parent.name[4:]))
 
-    initial_results = NAN_RESULTS if 0 in nan_generations else EVAL_RESULTS
-    runner.scheduler.run = lambda exec_fname, results_dir: (initial_results, 0.0)
+    runner.scheduler.run = lambda exec_fname, results_dir: (results_of(0), 0.0)
     runner.scheduler.get_job_results_async = get_job_results
     if meta_llm:
         runner.meta_summarizer.async_llm_client = meta_llm
@@ -311,10 +325,13 @@ def launch(
     meta_rec_interval: int = 3,
     nan_generations=(),
     max_db_workers: int = 2,
+    scores: dict[int, float] | None = None,
+    db_options: dict | None = None,
 ) -> SimpleNamespace:
     """Run one launch of a search on run_dir, from the setup to the final summary.
 
-    The launch completes one job for each generation of the list. The result
+    The launch completes one job for each generation of the list, in their
+    order (see make_runner() for the other arguments). The result
     holds what the first proposal of the launch sees (the recommendation, the
     API cost of the search, the count of the meta updates of the launch, the
     state file after the cost writes, and the seconds from the last progress
@@ -328,6 +345,8 @@ def launch(
         meta_rec_interval,
         nan_generations=nan_generations,
         max_db_workers=max_db_workers,
+        scores=scores,
+        db_options=db_options,
     )
     seen = SimpleNamespace(
         first_recommendation=None,
@@ -1308,12 +1327,17 @@ def console_costs(text: str) -> dict[str, float]:
     }
 
 
-def final_table_meta_costs(run: FakeWandbRun, run_dir: Path) -> dict[int, float]:
+def final_table_meta_costs(
+    run: FakeWandbRun, run_dir: Path, with_copies: bool = False
+) -> dict:
     """Give the meta cost of each evaluated program in the last final W&B table.
 
     A row of the table gives the sum of the costs of its program. The meta
     cost is that sum less the other costs, which the database holds. The
-    result is by generation. As on main, an island copy has no meta cost.
+    result is by generation. As on main, the copy of the initial program has
+    no meta cost. With with_copies, the result also gives the meta cost of
+    each island copy, by generation and island: a new island copies the
+    metadata of its program, thus that copy can have a meta cost.
     """
     tables = [p[PROGRAM_TABLE_KEY] for p in run.payloads if PROGRAM_TABLE_KEY in p]
     row_costs = {row[0]: row[-1] for row in tables[-1].data}
@@ -1334,20 +1358,39 @@ def final_table_meta_costs(run: FakeWandbRun, run_dir: Path) -> dict[int, float]
         meta_cost = round(row_costs[program.id] - other_costs, 6)
         if program.id in evaluated_ids:
             meta_costs[program.generation] = meta_cost
+        elif with_copies:
+            meta_costs[(program.generation, program.island_idx)] = meta_cost
         else:
             assert meta_cost == 0, program.metadata
     return meta_costs
 
 
-def stored_meta_costs_by_generation(run_dir: Path) -> dict[int, float]:
-    """Give the meta cost of each evaluated program of the database, by generation."""
+def stored_meta_costs_by_generation(run_dir: Path, with_copies: bool = False) -> dict:
+    """Give the meta cost of each evaluated program of the database, by generation.
+
+    With with_copies, also give the meta cost of each island copy, by
+    generation and island.
+    """
     config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
     db = ProgramDatabase(config=config, embedding_model="", read_only=True)
     try:
-        return {
+        evaluated = db.get_evaluated_programs()
+        costs: dict = {
             p.generation: round(p.metadata.get("meta_cost") or 0.0, 6)
-            for p in db.get_evaluated_programs()
+            for p in evaluated
         }
+        if with_copies:
+            evaluated_ids = {p.id for p in evaluated}
+            costs.update(
+                {
+                    (p.generation, p.island_idx): round(
+                        p.metadata.get("meta_cost") or 0.0, 6
+                    )
+                    for p in db.get_all_programs()
+                    if p.id not in evaluated_ids
+                }
+            )
+        return costs
     finally:
         db.close()
 
@@ -1562,6 +1605,93 @@ def test_final_table_and_console_summary_are_as_on_main_then_two_resumes(
     # database does not hold.
     assert waiting_generations(read_state(run_dir)) == []
     assert saves and not any(saves)
+
+
+# The paths whose meta update writes its cost to the program of the update,
+# in a launch whose new island then copies that program. Each path gives the
+# interval, the generations of the jobs, the scores that make that program
+# the best program, and its generation.
+ISLAND_COPY_PATHS = {
+    "initial program": (1, [1], {0: 2.0}, 0),
+    "completed job": (2, [1, 2], {1: 2.0}, 1),
+}
+# One island at the start. A job with no better score makes a new island,
+# which gets a copy of the best program, with its metadata in the database.
+DYNAMIC_ISLANDS = {
+    "num_islands": 1,
+    "enable_dynamic_islands": True,
+    "stagnation_threshold": 1,
+    "island_spawn_strategy": "best",
+}
+
+
+def final_readers_with_dynamic_islands(
+    run_dir, monkeypatch, path, name, generations, failure=None
+) -> dict:
+    """Run one launch with dynamic islands, with the failure point of a cost write.
+
+    Return the meta cost of each row of the final W&B table, and the totals
+    of the final console summary.
+    """
+    interval, _, scores, _ = ISLAND_COPY_PATHS[path]
+    with monkeypatch.context() as patch:
+        run = record_wandb(patch)
+        texts = record_final_console_summaries(patch)
+        if failure:
+            FINAL_READER_FAILURES[failure](patch)
+        launch(
+            run_dir,
+            StubMetaLLM(name),
+            generations,
+            meta_rec_interval=interval,
+            scores=scores,
+            db_options=DYNAMIC_ISLANDS,
+        )
+    (text,) = texts
+    return {
+        "table": final_table_meta_costs(run, run_dir, with_copies=True),
+        "console": console_costs(text),
+    }
+
+
+@pytest.mark.parametrize("path", ISLAND_COPY_PATHS)
+@pytest.mark.parametrize("failure", ["fails 1 time", "fails 3 times"])
+def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
+    tmp_path, monkeypatch, failure, path
+):
+    run_dir = tmp_path / "run"
+    _, generations, _, update_generation = ISLAND_COPY_PATHS[path]
+    reference = final_readers_with_dynamic_islands(
+        tmp_path / "reference", monkeypatch, path, "launch 1", generations
+    )
+
+    result = final_readers_with_dynamic_islands(
+        run_dir, monkeypatch, path, "launch 1", generations, failure
+    )
+
+    # The new island 1 copies the program of the update after the update. As
+    # on main, the copy repeats the cost that its program has at that time.
+    copy_key = (update_generation, 1)
+    assert 0 < reference["table"][copy_key] <= reference["table"][update_generation]
+    # main writes the cost of an update of the setup or of a job with the
+    # metadata of its program, and a new island copies that metadata. Thus a
+    # cost write changes no row of the final table and no console summary of
+    # main, also the row of the copy.
+    assert result == reference
+
+    # A resume. Its final readers show the costs of the database. When each
+    # try of the cost write fails, the database holds that cost for neither
+    # the program nor its copy, and the resume makes the update again. main
+    # keeps the cost of the copy: a limit of this design.
+    resume = final_readers_with_dynamic_islands(
+        run_dir, monkeypatch, path, "launch 2", []
+    )
+    stored = stored_meta_costs_by_generation(run_dir, with_copies=True)
+    assert resume["table"] == stored
+    assert resume["console"]["Total Meta Cost"] == pytest.approx(
+        round(sum(stored.values()), 2)
+    )
+    assert (stored[copy_key] > 0) == (failure == "fails 1 time")
 
 
 def make_meta_program(generation: int) -> Program:
@@ -3090,6 +3220,50 @@ def test_meta_costs_of_the_database_skip_the_island_copies(tmp_path):
     runner.db = db
 
     assert runner._get_meta_costs() == pytest.approx(0.03)
+    db.close()
+
+
+def test_each_island_copy_gives_its_source_program(tmp_path):
+    # The first program gets a copy on each other island.
+    config = DatabaseConfig(db_path=str(tmp_path / "first.sqlite"), num_islands=3)
+    db = ProgramDatabase(config=config, embedding_model="")
+    db.add(make_program("gen-0", generation=0, score=1.0))
+    copies = [p.id for p in db.get_all_programs() if p.id != "gen-0"]
+    assert db.island_manager.copy_sources == {copy_id: "gen-0" for copy_id in copies}
+    assert len(copies) == 2
+    db.close()
+
+    # Generation 1 is no better than generation 0, thus a new island gets a
+    # copy of the initial program and of its best correct child. The
+    # maintenance on the write queue gives the copies that it made.
+    config = DatabaseConfig(
+        db_path=str(tmp_path / "spawn.sqlite"),
+        num_islands=1,
+        enable_dynamic_islands=True,
+        stagnation_threshold=1,
+        island_spawn_subtree_size=2,
+    )
+    db = ProgramDatabase(config=config, embedding_model="")
+    db.add(make_program("gen-0", generation=0, score=1.0))
+    child = make_program("gen-1", generation=1, score=0.5)
+    child.parent_id = "gen-0"
+
+    async def add_then_maintain():
+        async_db = AsyncProgramDatabase(db)
+        try:
+            await async_db.add_program_async(child, defer_maintenance=True)
+            return await async_db.run_program_maintenance_async(child)
+        finally:
+            await async_db.close_async()
+
+    copy_sources = asyncio.run(add_then_maintain())
+
+    assert copy_sources == {
+        p.id: p.metadata["_spawned_from_program_id"]
+        for p in db.get_all_programs()
+        if p.metadata.get("_spawned_island")
+    }
+    assert sorted(copy_sources.values()) == ["gen-0", "gen-1"]
     db.close()
 
 

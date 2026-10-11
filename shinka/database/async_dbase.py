@@ -666,10 +666,14 @@ class AsyncProgramDatabase:
         program: Program,
         verbose: bool = False,
         recompute_embeddings: bool = False,
-    ) -> None:
-        """Replay deferred post-insert maintenance on the writer lane."""
+    ) -> Dict[str, str]:
+        """Replay deferred post-insert maintenance on the writer lane.
 
-        def run_maintenance_sync():
+        Returns the source program id of each island copy that the
+        maintenance made, by copy id.
+        """
+
+        def run_maintenance_sync() -> Dict[str, str]:
             thread_db = None
             try:
                 thread_db = ProgramDatabase(
@@ -686,12 +690,13 @@ class AsyncProgramDatabase:
                     recompute_embeddings=recompute_embeddings,
                 )
                 self._merge_runtime_metadata_from_db(thread_db)
+                return dict(thread_db.island_manager.copy_sources)
             finally:
                 if thread_db is not None:
                     thread_db.close()
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.write_executor, run_maintenance_sync)
+        return await loop.run_in_executor(self.write_executor, run_maintenance_sync)
 
     async def update_program_metadata_async(
         self,

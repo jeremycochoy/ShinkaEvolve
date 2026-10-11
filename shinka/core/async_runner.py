@@ -560,7 +560,8 @@ class ShinkaEvolveRunner:
         self.total_api_cost = 0.0
         self.start_time = None
         # The cost of each meta update of the setup and of the jobs of the
-        # launch, by program id, then by update id
+        # launch, by program id, then by update id. An island copy of the
+        # launch repeats the costs of its source program
         self.live_meta_costs: Dict[str, Dict[str, float]] = {}
 
         # In-flight cost estimation for accurate budget enforcement
@@ -744,6 +745,19 @@ class ShinkaEvolveRunner:
         self.live_meta_costs.setdefault(program.id, {})[update.update_id] = (
             update.cost
         )
+
+    def _keep_live_meta_costs_of_copies(self, copy_sources: Dict[str, str]) -> None:
+        """Give each new island copy the live meta costs of its source program.
+
+        As on main, a copy holds the meta cost that its source holds at the
+        time of the copy: the copy repeats that cost. The setup adds the
+        initial program before any meta update of the launch, thus its copies
+        have no live cost.
+        """
+        for copy_id, source_id in copy_sources.items():
+            live_costs = self.live_meta_costs.get(source_id)
+            if live_costs:
+                self.live_meta_costs[copy_id] = dict(live_costs)
 
     async def _write_meta_output(self) -> None:
         """Write the output file of the last meta update.
@@ -4613,10 +4627,11 @@ class ShinkaEvolveRunner:
 
         try:
             if hasattr(self.async_db, "run_program_maintenance_async"):
-                await self.async_db.run_program_maintenance_async(
+                copy_sources = await self.async_db.run_program_maintenance_async(
                     program,
                     verbose=self.verbose,
                 )
+                self._keep_live_meta_costs_of_copies(copy_sources or {})
 
             system_prompt_id = None
             if job.meta_patch_data:
