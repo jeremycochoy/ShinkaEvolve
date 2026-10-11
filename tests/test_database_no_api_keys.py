@@ -115,7 +115,7 @@ def test_async_db_add_skips_duplicate_source_job_id(monkeypatch):
                 assert sync_db.get("async-p0") is not None
                 assert sync_db.get("async-p1") is None
                 assert sync_db._count_programs_in_db() == 1
-                assert sync_db.has_program_with_source_job_id("job-123") is True
+                assert sync_db.has_program_with_source_job_id("job-123", 0) is True
             finally:
                 await async_db.close_async()
                 sync_db.close()
@@ -136,8 +136,8 @@ def test_async_db_source_job_id_check_treats_inflight_insert_as_existing(monkeyp
             )
             async_db = AsyncProgramDatabase(sync_db=sync_db)
             try:
-                async_db._in_flight_source_job_ids.add("job-123")
-                assert await async_db.has_program_with_source_job_id_async("job-123")
+                async_db._in_flight_source_jobs.add(("job-123", 0))
+                assert await async_db.has_program_with_source_job_id_async("job-123", 0)
             finally:
                 await async_db.close_async()
                 sync_db.close()
@@ -163,7 +163,9 @@ def test_async_db_can_fetch_program_by_source_job_id(monkeypatch):
 
                 await async_db.add_program_async(program)
 
-                recovered = await async_db.get_program_by_source_job_id_async("job-123")
+                recovered = await async_db.get_program_by_source_job_id_async(
+                    "job-123", 0
+                )
 
                 assert recovered is not None
                 assert recovered.id == "async-p0"
@@ -188,7 +190,7 @@ def test_async_db_add_skips_source_job_id_while_another_insert_is_inflight(monke
             )
             async_db = AsyncProgramDatabase(sync_db=sync_db)
             try:
-                async_db._in_flight_source_job_ids.add("job-123")
+                async_db._in_flight_source_jobs.add(("job-123", 0))
                 duplicate = _program("async-p1")
                 duplicate.metadata = {"source_job_id": "job-123"}
 
@@ -196,6 +198,95 @@ def test_async_db_add_skips_source_job_id_while_another_insert_is_inflight(monke
 
                 assert sync_db.get("async-p1") is None
                 assert sync_db._count_programs_in_db() == 0
+            finally:
+                await async_db.close_async()
+                sync_db.close()
+
+    asyncio.run(_run())
+
+
+def _job_program(program_id: str, source_job_id: str, generation: int) -> Program:
+    program = _program(program_id)
+    program.generation = generation
+    program.metadata = {"source_job_id": source_job_id}
+    return program
+
+
+def test_async_db_adds_a_new_job_with_the_identifier_of_a_stored_job(monkeypatch):
+    """The system can give the PID of an ended local job to a new job.
+
+    A row is the same job only when its job id and its generation are the same.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    job_id = "ProcessWithLogging(PID: 4242)"
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "reused_source_job.db"
+            sync_db = ProgramDatabase(
+                config=DatabaseConfig(db_path=str(db_path), num_islands=1),
+                embedding_model="",
+            )
+            async_db = AsyncProgramDatabase(sync_db=sync_db)
+            try:
+                assert await async_db.add_program_async(
+                    _job_program("gen-1", job_id, 1)
+                )
+                assert await async_db.add_program_async(
+                    _job_program("gen-2", job_id, 2)
+                )
+                # A second insert of the same job adds no row.
+                again = _job_program("gen-2-again", job_id, 2)
+                assert not await async_db.add_program_async(again)
+
+                assert sync_db._count_programs_in_db() == 2
+                for generation in (1, 2):
+                    program = await async_db.get_program_by_source_job_id_async(
+                        job_id, generation
+                    )
+                    assert program.id == f"gen-{generation}"
+                    assert await async_db.has_program_with_source_job_id_async(
+                        job_id, generation
+                    )
+                assert (
+                    await async_db.get_program_by_source_job_id_async(job_id, 3) is None
+                )
+                assert not sync_db.has_program_with_source_job_id(job_id, 3)
+            finally:
+                await async_db.close_async()
+                sync_db.close()
+
+    asyncio.run(_run())
+
+
+def test_async_db_insert_in_flight_stops_only_the_same_job(monkeypatch):
+    """An insert in flight stops an other insert of its job and generation only."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    job_id = "ProcessWithLogging(PID: 4242)"
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "inflight_reused_source_job.db"
+            sync_db = ProgramDatabase(
+                config=DatabaseConfig(db_path=str(db_path), num_islands=1),
+                embedding_model="",
+            )
+            async_db = AsyncProgramDatabase(sync_db=sync_db)
+            try:
+                async_db._in_flight_source_jobs.add((job_id, 1))
+                assert await async_db.has_program_with_source_job_id_async(job_id, 1)
+                assert not await async_db.has_program_with_source_job_id_async(
+                    job_id, 2
+                )
+
+                assert not await async_db.add_program_async(
+                    _job_program("gen-1", job_id, 1)
+                )
+                assert await async_db.add_program_async(
+                    _job_program("gen-2", job_id, 2)
+                )
+                assert sync_db.get("gen-1") is None
+                assert sync_db.get("gen-2") is not None
             finally:
                 await async_db.close_async()
                 sync_db.close()

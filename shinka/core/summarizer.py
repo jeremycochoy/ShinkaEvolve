@@ -48,6 +48,10 @@ class MetaSummarizer:
         # Track the accumulated count of programs processed in meta updates
         self.total_programs_processed = 0
 
+        # Track the ids of the processed programs, so that a resume can find
+        # the programs of the database that the state does not hold
+        self.processed_program_ids: List[str] = []
+
     def add_evaluated_program(self, program: Program) -> None:
         """Add newly evaluated program to the tracking list."""
         logger.debug(
@@ -72,6 +76,27 @@ class MetaSummarizer:
                     f"programs tracked"
                 )
         self._last_logged_count = len(self.evaluated_since_last_meta)
+
+    def add_unknown_programs(self, programs: List[Program]) -> None:
+        """Add each program that the state does not hold, processed or waiting.
+
+        A state file from before the ids holds the count of its processed
+        programs and no id. They are then the first programs that the search
+        evaluated.
+        """
+        known_ids = set(self.processed_program_ids)
+        known_ids.update(p.id for p in self.evaluated_since_last_meta)
+        unknown = [p for p in programs if p.id not in known_ids]
+
+        if self.total_programs_processed > 0 and not self.processed_program_ids:
+            first_evaluated = sorted(unknown, key=lambda p: p.timestamp)
+            first_evaluated = first_evaluated[: self.total_programs_processed]
+            self.processed_program_ids = [p.id for p in first_evaluated]
+            known_ids.update(self.processed_program_ids)
+            unknown = [p for p in unknown if p.id not in known_ids]
+
+        for program in unknown:
+            self.add_evaluated_program(program)
 
     def should_update_meta(self, meta_rec_interval: Optional[int]) -> bool:
         """Check if meta update should be performed based on interval.
@@ -175,6 +200,7 @@ class MetaSummarizer:
         # will be saved as "unprocessed" programs
         num_processed = len(self.evaluated_since_last_meta)
         self.total_programs_processed += num_processed
+        self.processed_program_ids.extend(p.id for p in self.evaluated_since_last_meta)
         self.evaluated_since_last_meta = []
         logger.info(
             f"Processed and cleared {num_processed} programs from meta memory "
@@ -494,6 +520,7 @@ class MetaSummarizer:
         Only saves:
         1. Current meta state (summary, scratchpad, recommendations)
         2. Unprocessed programs that haven't been summarized yet
+        3. The ids of the processed programs
         """
         try:
             # Only serialize unprocessed programs (those added since last meta update)
@@ -516,6 +543,7 @@ class MetaSummarizer:
                 "meta_recommendations": self.meta_recommendations,
                 "meta_recommendations_history": (self.meta_recommendations_history),
                 "total_programs_meta_processed": self.total_programs_processed,
+                "processed_program_ids": self.processed_program_ids,
             }
 
             # Ensure directory exists
@@ -685,6 +713,7 @@ class MetaSummarizer:
             self.total_programs_processed = meta_data.get(
                 "total_programs_meta_processed", 0
             )
+            self.processed_program_ids = meta_data.get("processed_program_ids", [])
 
             # Debug logging for meta recommendations
             if self.meta_recommendations:
@@ -720,6 +749,10 @@ class MetaSummarizer:
             logger.debug(f"Full traceback: {traceback.format_exc()}")
             return False
 
+    def get_meta_output_path(self, results_dir: str) -> Path:
+        """Get the path of the output file of the last meta update."""
+        return Path(results_dir) / "meta" / f"meta_{self.total_programs_processed}.txt"
+
     def write_meta_output(self, results_dir: str) -> None:
         """Write meta summary, scratchpad, and recommendations to a file."""
         output_str = ""
@@ -752,10 +785,9 @@ class MetaSummarizer:
 
         if output_str:
             # Create meta subdirectory if it doesn't exist
-            meta_dir = Path(results_dir) / "meta"
-            meta_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = self.get_meta_output_path(results_dir)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
 
-            meta_path = meta_dir / f"meta_{self.total_programs_processed}.txt"
             with meta_path.open("w", encoding="utf-8") as f:
                 f.write(output_str)
             logger.info(f"Wrote meta output to {meta_path}")

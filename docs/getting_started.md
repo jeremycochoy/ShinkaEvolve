@@ -401,6 +401,7 @@ runner.run()
 | `num_generations` | Set to **total** desired, not additional (completed 20, want 30 more = set 50) |
 | DB config | Must match the original run |
 | Prior state | Best solutions and meta-recommendations are preserved |
+| Meta state | Kept in `meta_memory.json`. Without this file, a resume queues each stored program for the meta summary and runs the update that is due before the first new proposal |
 
 ### Environment management
 

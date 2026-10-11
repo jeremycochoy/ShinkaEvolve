@@ -9,9 +9,10 @@ import re
 import uuid
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from shinka.database import Program, ProgramDatabase
+from shinka.database.dbase import meta_cost_with_live_costs
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,24 @@ def program_costs(program: Program) -> Dict[str, float]:
         name: _finite_float(metadata.get(metadata_key)) or 0.0
         for name, metadata_key in _COST_KEYS.items()
     }
+
+
+def add_live_meta_costs(
+    programs: Sequence[Program], live_meta_costs: Mapping[str, Dict[str, float]]
+) -> None:
+    """Give each program its meta cost in the database plus its live meta costs.
+
+    live_meta_costs gives the live meta costs of each program, by program id
+    (see meta_cost_with_live_costs()).
+    """
+    for program in programs:
+        live_costs = live_meta_costs.get(program.id)
+        if live_costs:
+            metadata = program.metadata or {}
+            program.metadata = {
+                **metadata,
+                "meta_cost": meta_cost_with_live_costs(metadata, live_costs),
+            }
 
 
 def program_table_row(program: Program) -> List[Any]:
@@ -278,11 +297,13 @@ class ShinkaWandbLogger:
         db: Optional[ProgramDatabase],
         total_proposals_generated: Optional[int] = None,
         total_api_cost: Optional[float] = None,
+        live_meta_costs: Optional[Mapping[str, Dict[str, float]]] = None,
     ) -> None:
         if not self.active or db is None:
             return
         try:
             programs = db.get_all_programs()
+            add_live_meta_costs(programs, live_meta_costs or {})
             self._run.summary.update(
                 build_run_summary(
                     programs,

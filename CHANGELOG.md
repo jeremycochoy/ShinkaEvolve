@@ -26,6 +26,40 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ### Fixed
 
+- Fixed the async runner so the meta summary continues across a resume. The
+  runner saves the meta state to `meta_memory.json` in the results directory
+  after each meta update and at the end of a run. A launch on a database with
+  an evaluated program loads that file, and adds each evaluated program of the
+  database that the state does not hold. A resume then makes the meta update
+  that is due before the first new proposal. As before, the state in memory
+  takes a meta update after its step 3, then the output file comes, then the
+  cost total counts the update. A task then adds the cost to the value in the
+  database, in the write queue of the database, one time for each update id,
+  so a write that commits and then fails adds nothing. The saved state holds
+  an update only when the database holds its cost: until that write, a save
+  writes the state from before the update, and a later launch makes the update
+  again when the write fails or the process stops. A full metadata write of a
+  program keeps the meta cost of the database. As before, the final W&B table
+  and the final console summary hold the cost of each update of the setup and
+  of the jobs of the run, also when its write fails or ends late: they merge
+  that cost with the costs of the database by update id. An error in the
+  write of an output file no longer stops the setup: the runner logs it. A
+  resume with no correct program also makes the update that is due, and writes
+  its cost to a waiting program. With no generation left or the cost budget
+  used, that update runs whatever the interval, because the final summary
+  needs a correct program.
+- Fixed step 1 of the async meta update to make one query for each program, so
+  each summary keeps the identifier of its program. Before, a failed answer
+  gave the later summaries the identifier of another program, and its program
+  got no summary. A program with a missing or blank answer now waits for the
+  next update.
+- Fixed the async runner so a new job with the identifier of a stored job gets
+  its own row. The identifier of a local job holds the PID of its process, and
+  the system can give that PID to a new process, for example after a resume.
+  The duplicate check of an insert, the set of the inserts in flight and the
+  row lookup now use the job identifier and the generation. Before, the new
+  program got no row, and the stored program got its side effects and its meta
+  summary a second time.
 - Fixed Azure OpenAI LLM client construction to use the v1 base URL contract,
   avoiding doubled `/openai/v1/openai` request paths and 404 responses reported
   in issue #147.

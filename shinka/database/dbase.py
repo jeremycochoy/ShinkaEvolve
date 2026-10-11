@@ -145,6 +145,29 @@ def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
     return decorator
 
 
+# The metadata fields of the meta costs of a program. Only add_meta_cost()
+# changes them in the database
+META_COST_FIELDS = ("meta_cost", "meta_cost_update_ids")
+
+
+def meta_cost_with_live_costs(
+    metadata: Dict[str, Any], live_costs: Dict[str, float]
+) -> float:
+    """Give the meta cost of a program: its cost in the database, plus its live costs.
+
+    live_costs gives the cost of each meta update of the launch that goes to
+    the program, by update id. The cost write of an update can fail or end
+    late. A live cost adds to the cost of the database only when the database
+    does not hold its update id, thus each cost counts one time.
+    """
+    stored_update_ids = set(metadata.get("meta_cost_update_ids") or [])
+    return float(metadata.get("meta_cost") or 0.0) + sum(
+        cost
+        for update_id, cost in live_costs.items()
+        if update_id not in stored_update_ids
+    )
+
+
 @dataclass
 class Program:
     """Represents a program in the database"""
@@ -742,8 +765,15 @@ class ProgramDatabase:
         return (self.cursor.fetchone() or {"COUNT(*)": 0})["COUNT(*)"]
 
     @db_retry()
-    def has_program_with_source_job_id(self, source_job_id: str) -> bool:
-        """Return True if a program row already exists for the given job id."""
+    def has_program_with_source_job_id(
+        self, source_job_id: str, generation: int
+    ) -> bool:
+        """Return True if a program row already exists for the given job.
+
+        The system can give the PID of an ended local job to a new job. Thus a
+        row is the same job only when its job id and its generation are the
+        same.
+        """
         if not self.cursor:
             return False
         self.cursor.execute(
@@ -752,15 +782,21 @@ class ProgramDatabase:
             FROM programs
             WHERE json_valid(metadata)
               AND json_extract(metadata, '$.source_job_id') = ?
+              AND generation = ?
             LIMIT 1
             """,
-            (source_job_id,),
+            (source_job_id, generation),
         )
         return self.cursor.fetchone() is not None
 
     @db_retry()
-    def get_program_by_source_job_id(self, source_job_id: str) -> Optional[Program]:
-        """Return the persisted program row for a completed scheduler job."""
+    def get_program_by_source_job_id(
+        self, source_job_id: str, generation: int
+    ) -> Optional[Program]:
+        """Return the persisted program row for a completed scheduler job.
+
+        The row has the job id and the generation of the job.
+        """
         if not self.cursor:
             return None
         self.cursor.execute(
@@ -769,9 +805,10 @@ class ProgramDatabase:
             FROM programs
             WHERE json_valid(metadata)
               AND json_extract(metadata, '$.source_job_id') = ?
+              AND generation = ?
             LIMIT 1
             """,
-            (source_job_id,),
+            (source_job_id, generation),
         )
         row = self.cursor.fetchone()
         return self._program_from_row(row) if row else None
@@ -1662,6 +1699,101 @@ class ProgramDatabase:
         # Filter out any None values that might result from row processing errors
         return [p for p in programs if p is not None]
 
+    def get_evaluated_programs(self) -> List[Program]:
+        """Get each evaluated program, in the order of the generations.
+
+        The island manager copies a program to seed an island, and a proposal
+        can fail before its evaluation. These rows have no evaluation of their
+        own, thus they are not in the list.
+        """
+        programs = [
+            p
+            for p in self.get_all_programs()
+            if not (
+                p.metadata.get("_is_island_copy")
+                or p.metadata.get("_spawned_island")
+                or p.metadata.get("node_kind") == "failed_proposal"
+            )
+        ]
+        return sorted(programs, key=lambda p: (p.generation, p.timestamp))
+
+    def add_meta_cost(
+        self, program_id: str, meta_cost: float, update_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update to the metadata of a program.
+
+        The read and the write of the metadata are in one IMMEDIATE
+        transaction. It holds the write lock of the database from the read to
+        the commit, thus no other write comes between them, and a cost write
+        never loses an other cost write. A missing cost counts as 0, and each
+        other field of the metadata stays as it is. The metadata keeps the id
+        of each update whose cost it holds, thus a second write of an update
+        adds nothing: a write that commits, and then fails. Returns the meta
+        cost fields of the program, or None when the database does not hold
+        the program.
+        """
+        if not self.cursor or not self.conn:
+            raise ConnectionError("DB not connected.")
+        # The JSON functions of SQLite do not read the NaN of Python, thus
+        # Python reads and writes the metadata
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.cursor.execute(
+                "SELECT metadata FROM programs WHERE id = ?", (program_id,)
+            )
+            row = self.cursor.fetchone()
+            if row is None:
+                return None
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            update_ids = metadata.get("meta_cost_update_ids") or []
+            if update_id not in update_ids:
+                metadata["meta_cost"] = (metadata.get("meta_cost") or 0.0) + meta_cost
+                metadata["meta_cost_update_ids"] = [*update_ids, update_id]
+                self.cursor.execute(
+                    "UPDATE programs SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata), program_id),
+                )
+                self.conn.commit()
+            return {field: metadata[field] for field in META_COST_FIELDS}
+        finally:
+            # Release the write lock when the add stops before its commit
+            if self.conn.in_transaction:
+                self.conn.rollback()
+
+    def update_program_metadata(
+        self, program_id: str, metadata: Dict[str, Any]
+    ) -> None:
+        """Write the metadata of a program, with the meta costs of the database.
+
+        The cost write of a meta update can commit before this write. The
+        read and the write are in one IMMEDIATE transaction, thus this write
+        keeps the meta cost fields that the database holds, and it ignores
+        the meta cost fields of its metadata.
+        """
+        if not self.cursor or not self.conn:
+            raise ConnectionError("DB not connected.")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.cursor.execute(
+                "SELECT metadata FROM programs WHERE id = ?", (program_id,)
+            )
+            row = self.cursor.fetchone()
+            try:
+                stored = json.loads(row["metadata"]) if row and row["metadata"] else {}
+            except json.JSONDecodeError:
+                # The write replaces stored metadata that is not JSON, as before
+                stored = {}
+            metadata = {k: v for k, v in metadata.items() if k not in META_COST_FIELDS}
+            metadata.update({k: stored[k] for k in META_COST_FIELDS if k in stored})
+            self.cursor.execute(
+                "UPDATE programs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), program_id),
+            )
+            self.conn.commit()
+        finally:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+
     @db_retry()
     def get_programs_summary(self) -> List[Dict[str, Any]]:
         """
@@ -2375,8 +2507,17 @@ class ProgramDatabase:
                 )
             logger.info(log_msg)
 
-    def print_summary(self, console=None, total_program_target: Optional[int] = None) -> None:
-        """Print a summary of the database contents using DatabaseDisplay."""
+    def print_summary(
+        self,
+        console=None,
+        total_program_target: Optional[int] = None,
+        live_meta_costs: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> None:
+        """Print a summary of the database contents using DatabaseDisplay.
+
+        live_meta_costs gives the live meta costs of each program, by program
+        id (see meta_cost_with_live_costs()).
+        """
         if not hasattr(self, "_database_display"):
             self._database_display = DatabaseDisplay(
                 cursor=self.cursor,
@@ -2394,6 +2535,7 @@ class ProgramDatabase:
         self._database_display.print_summary(
             console,
             total_program_target=total_program_target,
+            live_meta_costs=live_meta_costs,
         )
 
     def _print_program_summary(self, program) -> None:

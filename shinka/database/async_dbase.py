@@ -10,7 +10,7 @@ import time
 import threading
 import traceback
 from typing import List, Optional, Tuple, Dict, Any
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from .complexity import analyze_code_metrics
 from .dbase import Program, ProgramDatabase
@@ -98,9 +98,13 @@ class AsyncProgramDatabase:
             max_workers = 1
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.write_executor = ThreadPoolExecutor(max_workers=max_workers)
+        # The write in the write queue of each meta cost write in progress, by
+        # update id
+        self.meta_cost_writes: Dict[str, Future] = {}
         self._lock = asyncio.Lock()
         self._source_job_id_lock = threading.Lock()
-        self._in_flight_source_job_ids: set[str] = set()
+        # The (job id, generation) of each insert in flight
+        self._in_flight_source_jobs: set[tuple[str, int]] = set()
         # Semaphore to limit concurrent database operations and prevent deadlocks
         # With WAL mode enabled, we can handle more concurrent operations safely
         concurrent_ops = min(
@@ -604,18 +608,23 @@ class AsyncProgramDatabase:
                 source_job_id_registered = False
                 if isinstance(program.metadata, dict):
                     source_job_id = program.metadata.get("source_job_id")
+                # A row is the same job only when its job id and its
+                # generation are the same: the system can give the PID of an
+                # ended local job to a new job
+                source_job = (source_job_id, program.generation)
                 if isinstance(source_job_id, str) and source_job_id:
                     with self._source_job_id_lock:
                         if (
-                            source_job_id in self._in_flight_source_job_ids
-                            or thread_db.has_program_with_source_job_id(source_job_id)
+                            source_job in self._in_flight_source_jobs
+                            or thread_db.has_program_with_source_job_id(*source_job)
                         ):
                             logger.info(
-                                "Skipping duplicate persisted job for source_job_id=%s",
-                                source_job_id,
+                                "Skipping duplicate persisted job for "
+                                "source_job_id=%s, generation=%s",
+                                *source_job,
                             )
                             return False
-                        self._in_flight_source_job_ids.add(source_job_id)
+                        self._in_flight_source_jobs.add(source_job)
                         source_job_id_registered = True
 
                 # Temporarily disable expensive operations
@@ -633,7 +642,7 @@ class AsyncProgramDatabase:
                 finally:
                     if source_job_id_registered:
                         with self._source_job_id_lock:
-                            self._in_flight_source_job_ids.discard(source_job_id)
+                            self._in_flight_source_jobs.discard(source_job)
                     # Restore original methods
                     thread_db._recompute_embeddings_and_clusters = (
                         original_embedding_method
@@ -660,10 +669,14 @@ class AsyncProgramDatabase:
         program: Program,
         verbose: bool = False,
         recompute_embeddings: bool = False,
-    ) -> None:
-        """Replay deferred post-insert maintenance on the writer lane."""
+    ) -> Dict[str, str]:
+        """Replay deferred post-insert maintenance on the writer lane.
 
-        def run_maintenance_sync():
+        Returns the source program id of each island copy that the
+        maintenance made, by copy id.
+        """
+
+        def run_maintenance_sync() -> Dict[str, str]:
             thread_db = None
             try:
                 thread_db = ProgramDatabase(
@@ -680,19 +693,23 @@ class AsyncProgramDatabase:
                     recompute_embeddings=recompute_embeddings,
                 )
                 self._merge_runtime_metadata_from_db(thread_db)
+                return dict(thread_db.island_manager.copy_sources)
             finally:
                 if thread_db is not None:
                     thread_db.close()
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.write_executor, run_maintenance_sync)
+        return await loop.run_in_executor(self.write_executor, run_maintenance_sync)
 
     async def update_program_metadata_async(
         self,
         program_id: str,
         metadata: Dict[str, Any],
     ) -> None:
-        """Persist program metadata on the dedicated writer lane."""
+        """Persist program metadata on the dedicated writer lane.
+
+        The meta costs of the program stay as the database holds them.
+        """
 
         def update_metadata_sync():
             thread_db = None
@@ -701,20 +718,76 @@ class AsyncProgramDatabase:
                     self.sync_db.config,
                     embedding_model=self.sync_db.embedding_model,
                 )
-                payload = json.dumps(metadata)
-                thread_db.cursor.execute(
-                    "UPDATE programs SET metadata = ? WHERE id = ?",
-                    (payload, program_id),
-                )
-                thread_db.conn.commit()
+                thread_db.update_program_metadata(program_id, metadata)
             finally:
                 if thread_db is not None:
                     thread_db.close()
 
-        import json
-
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.write_executor, update_metadata_sync)
+
+    def _add_meta_cost_sync(
+        self, program_id: str, meta_cost: float, update_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update with a database of the worker thread."""
+        thread_db = None
+        try:
+            thread_db = ProgramDatabase(
+                self.sync_db.config,
+                embedding_model=self.sync_db.embedding_model,
+            )
+            return thread_db.add_meta_cost(program_id, meta_cost, update_id)
+        finally:
+            if thread_db is not None:
+                thread_db.close()
+
+    async def add_meta_cost_async(
+        self, program_id: str, meta_cost: float, update_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update to a program on the dedicated writer lane.
+
+        The write waits in the queue of the other writes, thus it does not
+        compete with them for the write lock of the database. The database
+        adds the cost of an update one time. Returns the meta cost fields of
+        the program, or None when the database does not hold the program.
+        """
+        write = self.write_executor.submit(
+            self._add_meta_cost_sync, program_id, meta_cost, update_id
+        )
+        self.meta_cost_writes[update_id] = write
+        try:
+            return await asyncio.wrap_future(write)
+        finally:
+            self.meta_cost_writes.pop(update_id, None)
+
+    def meta_cost_write_waits_in_queue(self, update_id: str) -> bool:
+        """Check if the cost write of a meta update waits in the write queue.
+
+        True when no worker of the queue took the write.
+        """
+        write = self.meta_cost_writes.get(update_id)
+        return write is not None and not write.running() and not write.done()
+
+    async def add_meta_cost_outside_the_queue_async(
+        self, program_id: str, meta_cost: float, update_id: str, timeout: float
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update in a separate worker, with 1 try.
+
+        The end of a launch uses it for a cost write that waits in the write
+        queue: an earlier write can hold each worker of the queue, while the
+        database accepts other writes. The add and the update id are the same,
+        thus the queued write adds nothing when it runs later. Raises
+        asyncio.TimeoutError after timeout seconds.
+        """
+        worker = ThreadPoolExecutor(max_workers=1)
+        try:
+            write = worker.submit(
+                self._add_meta_cost_sync, program_id, meta_cost, update_id
+            )
+            return await asyncio.wait_for(asyncio.wrap_future(write), timeout)
+        finally:
+            # A write that passes the time limit continues in its thread
+            worker.shutdown(wait=False)
 
     def _schedule_embedding_recomputation(self):
         """Schedule embedding recomputation as a background task."""
@@ -819,10 +892,17 @@ class AsyncProgramDatabase:
             logger.error(f"Error in async get_best_program: {e}")
             raise
 
-    async def has_program_with_source_job_id_async(self, source_job_id: str) -> bool:
-        """Check whether a completed job has already been persisted."""
+    async def has_program_with_source_job_id_async(
+        self, source_job_id: str, generation: int
+    ) -> bool:
+        """Check whether a completed job has already been persisted.
+
+        The job is the same only when its job id and its generation are the same.
+        """
         op_id = self._debug_track_start(
-            "has_program_with_source_job_id_async", source_job_id=source_job_id
+            "has_program_with_source_job_id_async",
+            source_job_id=source_job_id,
+            generation=generation,
         )
 
         try:
@@ -832,13 +912,15 @@ class AsyncProgramDatabase:
                 thread_db = None
                 try:
                     with self._source_job_id_lock:
-                        if source_job_id in self._in_flight_source_job_ids:
+                        if (source_job_id, generation) in self._in_flight_source_jobs:
                             return True
 
                     from .dbase import ProgramDatabase
 
                     thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
-                    return thread_db.has_program_with_source_job_id(source_job_id)
+                    return thread_db.has_program_with_source_job_id(
+                        source_job_id, generation
+                    )
                 finally:
                     if thread_db:
                         thread_db.close()
@@ -853,11 +935,16 @@ class AsyncProgramDatabase:
             raise
 
     async def get_program_by_source_job_id_async(
-        self, source_job_id: str
+        self, source_job_id: str, generation: int
     ) -> Optional[Program]:
-        """Fetch a persisted program row by completed scheduler job id."""
+        """Fetch a persisted program row by completed scheduler job id.
+
+        The row has the job id and the generation of the job.
+        """
         op_id = self._debug_track_start(
-            "get_program_by_source_job_id_async", source_job_id=source_job_id
+            "get_program_by_source_job_id_async",
+            source_job_id=source_job_id,
+            generation=generation,
         )
 
         try:
@@ -869,7 +956,9 @@ class AsyncProgramDatabase:
                     from .dbase import ProgramDatabase
 
                     thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
-                    return thread_db.get_program_by_source_job_id(source_job_id)
+                    return thread_db.get_program_by_source_job_id(
+                        source_job_id, generation
+                    )
                 finally:
                     if thread_db:
                         thread_db.close()
