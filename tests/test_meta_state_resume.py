@@ -1021,17 +1021,23 @@ def fail_cost_writes(patch) -> None:
     patch.setattr(ProgramDatabase, "add_meta_cost", locked_cost_write)
 
 
-def fail_the_first_cost_writes(patch, count: int) -> list:
-    """Make the first count writes of a meta cost fail, and the later succeed.
+def fail_the_first_tries_of_the_first_update(patch, count: int) -> list:
+    """Make the first count tries of the cost write of the first meta update fail.
 
-    Returns the list of the arguments of each write.
+    The later tries and the cost writes of the other updates succeed. The
+    cost writes of 2 updates can occur at the same time, thus a write of a
+    later update can come between 2 tries of the first update. The first
+    update is the update of the first write. Returns the list of the
+    arguments of each write.
     """
     add_meta_cost = ProgramDatabase.add_meta_cost
     calls = []
 
     def fail_then_write(db, *args):
         calls.append(args)
-        if len(calls) <= count:
+        first_update_id = calls[0][-1]
+        tries = [call for call in calls if call[-1] == first_update_id]
+        if args[-1] == first_update_id and len(tries) <= count:
             raise sqlite3.OperationalError("database is locked")
         return add_meta_cost(db, *args)
 
@@ -1182,8 +1188,8 @@ def retry_the_first_cost_write_after_the_wandb_log(patch, run, run_dir) -> list:
 
 # The failure points of the cost write of a meta update.
 COST_WRITE_FAILURES = {
-    "fails 1 time": partial(fail_the_first_cost_writes, count=1),
-    "fails 3 times": lambda patch: fail_the_first_cost_writes(
+    "fails 1 time": partial(fail_the_first_tries_of_the_first_update, count=1),
+    "fails 3 times": lambda patch: fail_the_first_tries_of_the_first_update(
         patch, async_summarizer.META_COST_WRITE_TRIES
     ),
     "fails each time": fail_cost_writes,
@@ -1531,8 +1537,8 @@ def check_each_save(patch, run_dir: Path) -> list[list[str]]:
 
 # The failure points of a cost write, for the final readers of the costs.
 FINAL_READER_FAILURES: dict[str, Callable[[Any], Any]] = {
-    "fails 1 time": partial(fail_the_first_cost_writes, count=1),
-    "fails 3 times": lambda patch: fail_the_first_cost_writes(
+    "fails 1 time": partial(fail_the_first_tries_of_the_first_update, count=1),
+    "fails 3 times": lambda patch: fail_the_first_tries_of_the_first_update(
         patch, async_summarizer.META_COST_WRITE_TRIES
     ),
     "is slow": commit_each_cost_write_late,
@@ -2297,8 +2303,32 @@ def test_cost_write_to_a_program_that_the_database_does_not_hold(tmp_path):
     assert waiting_generations(state) == [0, 1]
 
 
+def write_the_output_file_after_the_stop(patch) -> None:
+    """Make the output file write of a meta update end after the stop of the launch.
+
+    The caller of the update waits for that write until the stop reaches it.
+    Then the write runs, as a write in progress on main ends after a stop,
+    and the stop continues. A real write can end before the stop reaches the
+    caller. Then on Python 3.10 and 3.11, asyncio.wait_for() gives the result
+    of the final summary or of the update of a resume, and the launch
+    continues to its end.
+    """
+    write_meta_output_async = AsyncMetaSummarizer.write_meta_output_async
+
+    async def write_after_the_stop(self, results_dir):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await write_meta_output_async(self, results_dir)
+            raise
+
+    patch.setattr(AsyncMetaSummarizer, "write_meta_output_async", write_after_the_stop)
+
+
 @pytest.mark.parametrize("path", ["completed job", "resume", "final summary"])
-def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(tmp_path, path):
+def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(
+    tmp_path, monkeypatch, path
+):
     run_dir = tmp_path / "run"
     interval, num_generations = UPDATE_PATHS[path]
     if path == "resume":
@@ -2306,19 +2336,25 @@ def test_stop_between_step_3_and_the_cost_commit_then_two_resumes(tmp_path, path
         launch(run_dir, None, generations=[1])
     # Launch 1 stops as a stop of the process does, at the start of the cost
     # write of its first update: after step 3, before the commit of the cost.
+    # At that time, the update waits for the write of its output file.
     first_llm = StubMetaLLM("launch 1")
-    prompts = search(
-        run_dir,
-        first_llm,
-        interval,
-        num_generations,
-        stop_at=("_store_meta_cost", 1),
-    )
+    with monkeypatch.context() as patch:
+        write_the_output_file_after_the_stop(patch)
+        prompts = search(
+            run_dir,
+            first_llm,
+            interval,
+            num_generations,
+            stop_at=("_store_meta_cost", 1),
+        )
     assert first_llm.batches == [[0, 1]]
     stored = 0.01 * len(prompts)
 
-    # The stop can cut the write of the output file of the update, as on main.
-    assert meta_files(run_dir) in ([], ["meta_2.txt"])
+    # As a write in progress on main, the write of the output file of the
+    # update ends after the stop.
+    assert meta_files(run_dir) == ["meta_2.txt"]
+    output = (run_dir / "meta" / "meta_2.txt").read_text(encoding="utf-8")
+    assert "1. Recommendation of launch 1 update 1." in output
     # The database holds no cost of the update, thus no state file holds it.
     assert stored_meta_costs(run_dir) == 0
     assert read_state(run_dir) is None
@@ -2622,7 +2658,9 @@ def test_failed_cost_write_of_a_resume_leaves_the_next_update_to_the_state_file(
     # job of generation 3 makes the next update, whose cost write commits.
     meta_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
-        fail_the_first_cost_writes(patch, async_summarizer.META_COST_WRITE_TRIES)
+        fail_the_first_tries_of_the_first_update(
+            patch, async_summarizer.META_COST_WRITE_TRIES
+        )
         launch(run_dir, meta_llm, generations=[2, 3], meta_rec_interval=2)
 
     # The updates are the updates of main.
@@ -2862,7 +2900,7 @@ def test_failed_cost_write_is_written_again_with_the_same_update_id(
     # The first cost write of launch 1 fails. The later writes succeed.
     first_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
-        calls = fail_the_first_cost_writes(patch, 1)
+        calls = fail_the_first_tries_of_the_first_update(patch, 1)
         first = launch(run_dir, first_llm, generations, meta_rec_interval=interval)
 
     # The update writes its cost again with the same update id and no new LLM
