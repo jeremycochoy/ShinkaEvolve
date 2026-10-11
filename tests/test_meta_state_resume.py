@@ -1615,6 +1615,39 @@ ISLAND_COPY_PATHS = {
     "initial program": (1, [1], {0: 2.0}, 0),
     "completed job": (2, [1, 2], {1: 2.0}, 1),
 }
+
+
+def commit_the_first_cost_write_after_the_end_wait(patch) -> None:
+    """Make the cost write of the first meta update commit after the final W&B table.
+
+    Its worker thread hangs until that table, after the time limit of the
+    wait for the cost writes at the end of the launch. Then the write commits.
+    """
+    final_table_logged = threading.Event()
+    log_final = ShinkaWandbLogger.log_final
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    first_update: dict[str, str] = {}
+
+    def log_then_release(self, **kwargs):
+        log_final(self, **kwargs)
+        final_table_logged.set()
+
+    def wait_then_write(db, program_id, meta_cost, update_id):
+        if first_update.setdefault("id", update_id) == update_id:
+            assert final_table_logged.wait(timeout=30)
+        return add_meta_cost(db, program_id, meta_cost, update_id)
+
+    patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 1.0)
+    patch.setattr(ShinkaWandbLogger, "log_final", log_then_release)
+    patch.setattr(ProgramDatabase, "add_meta_cost", wait_then_write)
+
+
+# The failure points of the cost write of the update of a copied program.
+ISLAND_COPY_FAILURES: dict[str, Callable[[Any], Any]] = {
+    "fails 1 time": FINAL_READER_FAILURES["fails 1 time"],
+    "fails 3 times": FINAL_READER_FAILURES["fails 3 times"],
+    "commits late": commit_the_first_cost_write_after_the_end_wait,
+}
 # One island at the start. A job with no better score makes a new island,
 # which gets a copy of the best program, with its metadata in the database.
 DYNAMIC_ISLANDS = {
@@ -1623,6 +1656,30 @@ DYNAMIC_ISLANDS = {
     "stagnation_threshold": 1,
     "island_spawn_strategy": "best",
 }
+
+
+def launch_with_no_wait(run_dir, meta_llm, generations, interval, **options) -> None:
+    """Run one launch that completes one job for each generation of the list.
+
+    As launch(), but the launch does not wait for the cost writes after a
+    job (see make_runner() for the options).
+    """
+    runner = make_runner(run_dir, meta_llm, interval, **options)
+
+    async def complete_jobs():
+        try:
+            for generation in generations:
+                await complete_job(runner, generation)
+        finally:
+            runner.should_stop.set()
+            runner.finalization_complete.set()
+
+    async def no_proposals():
+        return None
+
+    runner._job_monitor_task = complete_jobs
+    runner._proposal_coordinator_task = no_proposals
+    asyncio.run(runner.run_async())
 
 
 def final_readers_with_dynamic_islands(
@@ -1638,12 +1695,12 @@ def final_readers_with_dynamic_islands(
         run = record_wandb(patch)
         texts = record_final_console_summaries(patch)
         if failure:
-            FINAL_READER_FAILURES[failure](patch)
-        launch(
+            ISLAND_COPY_FAILURES[failure](patch)
+        launch_with_no_wait(
             run_dir,
             StubMetaLLM(name),
             generations,
-            meta_rec_interval=interval,
+            interval,
             scores=scores,
             db_options=DYNAMIC_ISLANDS,
         )
@@ -1655,7 +1712,7 @@ def final_readers_with_dynamic_islands(
 
 
 @pytest.mark.parametrize("path", ISLAND_COPY_PATHS)
-@pytest.mark.parametrize("failure", ["fails 1 time", "fails 3 times"])
+@pytest.mark.parametrize("failure", ISLAND_COPY_FAILURES)
 def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     tmp_path, monkeypatch, failure, path
 ):
@@ -1679,10 +1736,12 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     # main, also the row of the copy.
     assert result == reference
 
-    # A resume. Its final readers show the costs of the database. When each
-    # try of the cost write fails, the database holds that cost for neither
-    # the program nor its copy, and the resume makes the update again. main
-    # keeps the cost of the copy: a limit of this design.
+    # A resume. Its final readers show the costs of the database. When the
+    # cost write commits after the copy, the copy gets the cost in the
+    # database at the end of the launch, as on main. When each try of the
+    # cost write fails, the database holds that cost for neither the program
+    # nor its copy, and the resume makes the update again. main keeps the
+    # cost of the copy: a limit of this design.
     resume = final_readers_with_dynamic_islands(
         run_dir, monkeypatch, path, "launch 2", []
     )
@@ -1691,7 +1750,7 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     assert resume["console"]["Total Meta Cost"] == pytest.approx(
         round(sum(stored.values()), 2)
     )
-    assert (stored[copy_key] > 0) == (failure == "fails 1 time")
+    assert (stored[copy_key] > 0) == (failure != "fails 3 times")
 
 
 def make_meta_program(generation: int) -> Program:

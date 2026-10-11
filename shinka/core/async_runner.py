@@ -563,6 +563,8 @@ class ShinkaEvolveRunner:
         # launch, by program id, then by update id. An island copy of the
         # launch repeats the costs of its source program
         self.live_meta_costs: Dict[str, Dict[str, float]] = {}
+        # The island copies of the launch that repeat a live meta cost
+        self.copies_with_live_costs: Set[str] = set()
 
         # In-flight cost estimation for accurate budget enforcement
         self.completed_proposal_costs: List[
@@ -758,6 +760,34 @@ class ShinkaEvolveRunner:
             live_costs = self.live_meta_costs.get(source_id)
             if live_costs:
                 self.live_meta_costs[copy_id] = dict(live_costs)
+                self.copies_with_live_costs.add(copy_id)
+
+    def _store_live_meta_costs_of_copies(self) -> None:
+        """Write to each island copy of the launch the costs that it repeats.
+
+        The copy takes the row of its source in the database, thus it lacks a
+        cost whose write commits after the copy. At the end of the launch,
+        after the database writers, each copy gets each of its live costs
+        whose update the database holds, as on main. A cost whose write
+        failed stays out, as for the source. An error goes to the log only.
+        """
+        if not self.copies_with_live_costs:
+            return
+        try:
+            update_ids = {
+                program.id: set(
+                    (program.metadata or {}).get("meta_cost_update_ids") or []
+                )
+                for program in self.db.get_all_programs()
+            }
+            stored_update_ids = set().union(*update_ids.values())
+            for copy_id in self.copies_with_live_costs:
+                missing = stored_update_ids - update_ids.get(copy_id, set())
+                for update_id, cost in self.live_meta_costs[copy_id].items():
+                    if update_id in missing:
+                        self.db.add_meta_cost(copy_id, cost, update_id)
+        except Exception as e:
+            logger.error(f"❌ Error in the meta costs of the island copies: {e}")
 
     async def _write_meta_output(self) -> None:
         """Write the output file of the last meta update.
@@ -1397,6 +1427,7 @@ class ShinkaEvolveRunner:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await self._cleanup_async()
             await self._take_late_meta_update()
+            self._store_live_meta_costs_of_copies()
 
         # Print final summary
         await self._print_final_summary()
