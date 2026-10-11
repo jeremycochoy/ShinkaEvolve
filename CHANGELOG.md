@@ -6,9 +6,13 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ### Added
 
+- Added native Google Gemini 3.7 Flash support at its introductory 2026 price.
+- Added native Google Gemini 3.6 Flash support with current pricing and
+  level-based thinking controls. Thanks @anantgar.
 - Added optional Weights & Biases logging with resumable run IDs, per-individual
-  scores, timing and cost metrics, and final run summaries in PR #149. Thanks
-  @anantgar.
+  scores, timing and cost metrics, and final run summaries in PR #149. PR #177
+  adds monotonic population/island snapshots and a secured metadata boundary.
+  Thanks @anantgar.
 - Added Verilog/SystemVerilog as a first-class evolution target in PR #137,
   including `.sv` task detection, syntax validation, EVOLVE-BLOCK marker support,
   failure-artifact rendering, and a self-contained RTLLM example. Thanks @Tyronita.
@@ -22,6 +26,13 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ### Changed
 
+- Reused provider SDK clients and their HTTP connection pools across compatible
+  requests, with explicit credential/configuration isolation, process-safe sync
+  caching, event-loop-scoped async caching, and cache shutdown helpers.
+- Reduced Python complexity-analysis overhead by parsing each candidate AST once
+  while preserving the existing metrics contract. Thanks @dexhunter.
+- Relaxed the exact HTTPX dependency pin to a `>=0.27` compatibility lower
+  bound in issue #180. Thanks @htmai-880.
 - Removed the automatic Claude Code Review pull-request workflow.
 
 ### Fixed
@@ -60,6 +71,25 @@ All notable changes to `shinka-evolve` are documented in this file.
   row lookup now use the job identifier and the generation. Before, the new
   program got no row, and the stored program got its side effects and its meta
   summary a second time.
+- Fixed Anthropic response parsing to dispatch by content-block type, avoiding
+  crashes and truncated output for redacted, thinking-only, and multi-block
+  responses in PR #188. Thanks @Atharva-Kanherkar.
+- Fixed Anthropic and DeepSeek token/cost accounting parity across synchronous
+  and asynchronous queries, including thinking-token decomposition and safe
+  zero-cost fallback for models missing from the pricing catalog. Runtime
+  models.dev refreshes now preserve pinned embedding-price overrides.
+- Fixed diff insertions (empty SEARCH blocks) splicing the payload directly
+  against the EVOLVE-BLOCK-END marker, which corrupted the marker line, let
+  consecutive insertions merge code lines into invalid programs, and caused
+  marker validation to reject every insertion patch for block-comment
+  languages such as Wolfram. Reported in issue #183. Thanks
+  @Atharva-Kanherkar.
+- Fixed Gemini retry handling so unsupported structured-output requests fail
+  immediately, synchronous retries are paced, and sync/async calls share the
+  same default thinking budget.
+- Fixed Rust candidate validation on stable toolchains by replacing the
+  nightly-only parser flag with isolated, non-mutating `rustfmt` syntax checks
+  in PR #179. Thanks @Atharva-Kanherkar.
 - Fixed Azure OpenAI LLM client construction to use the v1 base URL contract,
   avoiding doubled `/openai/v1/openai` request paths and 404 responses reported
   in issue #147.
