@@ -152,6 +152,7 @@ def test_get_client_llm_azure_responses_request_uses_v1_url(monkeypatch):
 
 
 def test_get_client_llm_gemini_sets_timeout(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     captured_kwargs = {}
     fake_client = object()
 
@@ -170,10 +171,15 @@ def test_get_client_llm_gemini_sets_timeout(monkeypatch):
     assert client is fake_client
     assert provider == "google"
     assert model_name == "gemini-2.5-flash"
-    assert captured_kwargs == {"timeout_ms": TIMEOUT * 1000}
+    assert captured_kwargs == {
+        "timeout_ms": TIMEOUT * 1000,
+        "auth_mode": "api_key",
+        "api_key": "",
+    }
 
 
 def test_get_async_client_llm_gemini_sets_timeout(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     captured_kwargs = {}
     fake_client = object()
 
@@ -192,7 +198,11 @@ def test_get_async_client_llm_gemini_sets_timeout(monkeypatch):
     assert client is fake_client
     assert provider == "google"
     assert model_name == "gemini-2.5-flash"
-    assert captured_kwargs == {"timeout_ms": TIMEOUT * 1000}
+    assert captured_kwargs == {
+        "timeout_ms": TIMEOUT * 1000,
+        "auth_mode": "api_key",
+        "api_key": "",
+    }
 
 
 def test_get_client_llm_local_openai_uses_api_key_env_query_param(monkeypatch):
