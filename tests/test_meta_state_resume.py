@@ -1031,6 +1031,20 @@ def commit_each_cost_write_late(patch, seconds: float = 0.5) -> None:
     patch.setattr(ProgramDatabase, "add_meta_cost", write_late)
 
 
+async def wait_before_the_write_queue(event: threading.Event) -> bool:
+    """Wait for an event (30 seconds at most) with no worker thread of the database.
+
+    The cost writes of 2 updates can wait at the same time. A wait in a
+    worker thread holds that worker, and the search needs a worker for its
+    other writes. A real database has no such wait: when it hangs, each write
+    waits, and when it continues, each write continues.
+    """
+    deadline = time.monotonic() + 30
+    while not event.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    return event.is_set()
+
+
 def hold_cost_writes_until_the_final_summary(patch) -> None:
     """Make each write of a meta cost wait until the final summary starts.
 
@@ -1038,11 +1052,11 @@ def hold_cost_writes_until_the_final_summary(patch) -> None:
     updates occur, as with a slow database.
     """
     final_summary_started = threading.Event()
-    add_meta_cost = ProgramDatabase.add_meta_cost
+    add_meta_cost_async = AsyncProgramDatabase.add_meta_cost_async
 
-    def wait_then_write(db, *args):
-        assert final_summary_started.wait(timeout=30)
-        return add_meta_cost(db, *args)
+    async def wait_then_write(self, *args):
+        assert await wait_before_the_write_queue(final_summary_started)
+        return await add_meta_cost_async(self, *args)
 
     summarize = AsyncMetaSummarizer.perform_final_summary_async
 
@@ -1050,7 +1064,7 @@ def hold_cost_writes_until_the_final_summary(patch) -> None:
         final_summary_started.set()
         return await summarize(self, *args, **kwargs)
 
-    patch.setattr(ProgramDatabase, "add_meta_cost", wait_then_write)
+    patch.setattr(AsyncProgramDatabase, "add_meta_cost_async", wait_then_write)
     patch.setattr(
         AsyncMetaSummarizer, "perform_final_summary_async", start_then_summarize
     )
@@ -1357,28 +1371,47 @@ def record_final_summaries(patch) -> list[tuple[int, float]]:
     return final_summaries
 
 
-def pass_the_time_limit_then_fail(patch) -> list[bool]:
+def pass_the_time_limit_then_fail(patch, first_update_only: bool = False) -> list[bool]:
     """Make each cost write wait until the final W&B table, then fail.
 
     Thus each cost write passes the time limit of the wait for the cost writes
-    at the end of the launch, as when the database hangs. Returns, for each
-    cost write, whether the final table came before the end of its wait.
+    at the end of the launch, as when the database hangs. Each cost write
+    waits before the write queue (see wait_before_the_write_queue()). With
+    first_update_only, only the cost write of the first meta update waits, in
+    its worker thread, as when that thread hangs: the other cost writes
+    commit. Returns, for each write that waits, whether the final table came
+    before its end.
     """
     final_table_logged = threading.Event()
     waits: list[bool] = []
     log_final = ShinkaWandbLogger.log_final
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    first_update: dict[str, str] = {}
 
     def log_then_release(self, **kwargs):
         log_final(self, **kwargs)
         final_table_logged.set()
 
-    def wait_then_fail(db, *args):
+    def wait_in_the_worker_then_fail(db, program_id, meta_cost, update_id):
+        if first_update.setdefault("id", update_id) != update_id:
+            return add_meta_cost(db, program_id, meta_cost, update_id)
         waits.append(final_table_logged.wait(timeout=30))
+        raise sqlite3.OperationalError("database is locked")
+
+    async def wait_then_fail(self, *args):
+        # The cleanup of the launch can stop the wait after the final table
+        try:
+            await wait_before_the_write_queue(final_table_logged)
+        finally:
+            waits.append(final_table_logged.is_set())
         raise sqlite3.OperationalError("database is locked")
 
     patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 1.0)
     patch.setattr(ShinkaWandbLogger, "log_final", log_then_release)
-    patch.setattr(ProgramDatabase, "add_meta_cost", wait_then_fail)
+    if first_update_only:
+        patch.setattr(ProgramDatabase, "add_meta_cost", wait_in_the_worker_then_fail)
+    else:
+        patch.setattr(AsyncProgramDatabase, "add_meta_cost_async", wait_then_fail)
     return waits
 
 
@@ -1418,6 +1451,9 @@ FINAL_READER_FAILURES: dict[str, Callable[[Any], Any]] = {
     ),
     "is slow": commit_each_cost_write_late,
     "passes the time limit": pass_the_time_limit_then_fail,
+    "the first passes the time limit": partial(
+        pass_the_time_limit_then_fail, first_update_only=True
+    ),
 }
 # What the final readers show after a fresh search with no failure point, by
 # interval.
@@ -1488,10 +1524,13 @@ def test_final_table_and_console_summary_are_as_on_main_then_two_resumes(
     # final table and no console summary of main. main writes the cost of its
     # final summary with 1 try, inside the time limit of the final summary.
     # Thus main loses that cost when the try fails or passes the time limit.
+    # A failure point of the first cost write goes to that try only when the
+    # final summary is the first update.
     main = {"table": reference["table"], "console": reference["console"]}
     final_summary_is_first = path == "final summary"
+    first_write_fails = failure != "is slow"
     if failure == "passes the time limit" or (
-        final_summary_is_first and failure.startswith("fails")
+        final_summary_is_first and first_write_fails
     ):
         main = without_the_final_summary_cost(reference)
     shown = {"table": result["table"], "console": result["console"]}
@@ -1504,7 +1543,7 @@ def test_final_table_and_console_summary_are_as_on_main_then_two_resumes(
     # As on main, the cost total counts each update. main does not count a
     # final summary whose cost write passes its time limit.
     assert result["cost total"] == reference["cost total"]
-    if failure == "passes the time limit":
+    if failure.endswith("passes the time limit"):
         assert result["failure point"] and all(result["failure point"])
 
     # 2 resumes. Their final table and their console summary show the costs
@@ -1590,25 +1629,26 @@ def test_two_updates_can_wait_for_their_cost_at_the_same_time(tmp_path):
         await summarizer.update_meta_memory_async(None, store_cost)
         for generation in (2, 3):
             summarizer.add_evaluated_program(make_meta_program(generation))
-        # Update 2 takes generations 2 and 3. Its cost write waits for the
-        # cost write of update 1: the cost writes run one at a time, in the
-        # order of the updates.
+        # Update 2 takes generations 2 and 3. Its cost write does not wait for
+        # the cost write of update 1: a late write does not stop a later one.
         await summarizer.update_meta_memory_async(None, store_cost)
         await asyncio.sleep(0.05)
-        assert len(writes) == 1
+        assert len(writes) == 2
         # The state in memory holds the 2 updates, as on main. The 2 updates
         # wait for their cost, thus a save holds neither of them.
         assert len(summarizer.meta_recommendations_history) == 2
         assert len(summarizer.unsaved_updates) == 2
         summarizer.save_meta_state(str(state_path))
         states = [read_state(tmp_path)]
-        # The cost of update 1 commits: the save holds update 1 only.
-        writes[0][1].set()
-        while len(writes) < 2:
-            await asyncio.sleep(0.01)
-        states.append(read_state(tmp_path))
-        # The cost of update 2 commits: the save holds the 2 updates.
+        # The cost of update 2 commits first, and update 2 waits for the cost
+        # write of update 1. A save holds an update exactly when the database
+        # holds its cost, thus its task saves update 2 at once.
         writes[1][1].set()
+        await asyncio.sleep(0.05)
+        assert len(summarizer.unsaved_updates) == 2
+        states.append(read_state(tmp_path))
+        # The cost of update 1 commits: the save holds update 1, then update 2.
+        writes[0][1].set()
         await summarizer.wait_for_cost_writes()
         states.append(read_state(tmp_path))
         return states
@@ -1616,22 +1656,74 @@ def test_two_updates_can_wait_for_their_cost_at_the_same_time(tmp_path):
     states = asyncio.run(two_updates())
 
     assert meta_llm.batches == [[0, 1], [2, 3]]
-    assert [len(state["meta_recommendations_history"]) for state in states] == [
-        0,
-        1,
-        2,
+    assert [state["meta_recommendations_history"] for state in states] == [
+        [],
+        ["1. Recommendation of launch 1 update 2."],
+        [
+            "1. Recommendation of launch 1 update 1.",
+            "1. Recommendation of launch 1 update 2.",
+        ],
     ]
     assert [waiting_generations(state) for state in states] == [
         [0, 1, 2, 3],
-        [2, 3],
+        [0, 1],
         [],
     ]
     assert [state["total_programs_meta_processed"] for state in states] == [0, 2, 4]
     assert states[0]["meta_recommendations"] is None
-    assert summary_labels(states[1]["meta_summary"]) == [(0, 0), (1, 1)]
+    assert summary_labels(states[1]["meta_summary"]) == [(2, 2), (3, 3)]
+    assert states[2]["meta_recommendations"] == (
+        "1. Recommendation of launch 1 update 2."
+    )
     assert summary_labels(states[2]["meta_summary"]) == [(g, g) for g in range(4)]
     assert summarizer.unsaved_updates == []
     assert writes[0][0] != writes[1][0]
+
+
+def test_failed_cost_write_keeps_the_order_of_the_saved_state(tmp_path):
+    meta_llm = StubMetaLLM("launch 1")
+    summarizer = make_summarizer(meta_llm, tmp_path / STATE_FILE)
+    update_numbers: dict[str, int] = {}
+    first_may_end: list[asyncio.Event] = []
+
+    async def store_cost(meta_cost, update_id):
+        number = update_numbers.setdefault(update_id, len(update_numbers) + 1)
+        if number == 1:
+            await first_may_end[0].wait()
+        if number == 2:
+            raise sqlite3.OperationalError("database is locked")
+
+    async def three_updates():
+        first_may_end.append(asyncio.Event())
+        # Update 1 takes generations 0 and 1, and its cost write waits.
+        await summarizer.update_meta_memory_async(None, store_cost)
+        # Each try of the cost write of update 2 fails, and the cost of update
+        # 3 commits.
+        for generations in ((2, 3), (4, 5)):
+            for generation in generations:
+                summarizer.add_evaluated_program(make_meta_program(generation))
+            await summarizer.update_meta_memory_async(None, store_cost)
+        await asyncio.sleep(0.05)
+        unsaved = len(summarizer.unsaved_updates)
+        first_may_end[0].set()
+        await summarizer.wait_for_cost_writes()
+        return unsaved
+
+    unsaved = asyncio.run(three_updates())
+
+    # Update 3 waits for update 1, also after the failed cost write of update
+    # 2. Thus the saved state takes update 1, then update 3, and the programs
+    # of update 2 wait.
+    assert meta_llm.batches == [[0, 1], [2, 3], [4, 5]]
+    assert unsaved == 3
+    state = read_state(tmp_path)
+    assert state["meta_recommendations_history"] == [
+        "1. Recommendation of launch 1 update 1.",
+        "1. Recommendation of launch 1 update 3.",
+    ]
+    assert state["meta_recommendations"] == "1. Recommendation of launch 1 update 3."
+    assert summary_labels(state["meta_summary"]) == [(0, 0), (1, 1), (4, 4), (5, 5)]
+    assert waiting_generations(state) == [2, 3]
 
 
 def test_failed_cost_write_leaves_the_next_update_to_the_saved_state(tmp_path):
@@ -1908,6 +2000,49 @@ def test_cost_write_that_ends_after_the_launch_goes_into_the_state_file(
     assert second_llm.batches == third_llm.batches == []
     assert second.api_cost == third.api_cost == pytest.approx(paid)
     assert meta_files(run_dir) == ["meta_2.txt"]
+
+
+def hold_the_first_cost_write(patch) -> None:
+    """Make the cost write of the first meta update wait until the process stops."""
+    add_meta_cost_async = AsyncProgramDatabase.add_meta_cost_async
+    first_update: dict[str, str] = {}
+
+    async def hold_then_write(self, program_id, meta_cost, update_id):
+        if first_update.setdefault("id", update_id) == update_id:
+            await asyncio.Event().wait()
+        return await add_meta_cost_async(self, program_id, meta_cost, update_id)
+
+    patch.setattr(AsyncProgramDatabase, "add_meta_cost_async", hold_then_write)
+
+
+def test_stop_while_an_update_waits_for_an_earlier_cost_write(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    # The cost write of the update of generation 1 does not end. The cost of
+    # the final summary commits, then the process stops with no cleanup at
+    # the wait for the cost writes.
+    first_llm = StubMetaLLM("launch 1")
+    with monkeypatch.context() as patch:
+        hold_the_first_cost_write(patch)
+        prompts = search(run_dir, first_llm, 2, 3, stop_at=("wait_for_cost_writes", 1))
+    assert first_llm.batches == [[0, 1], [2]]
+    paid = update_costs(first_llm.batches[1:])
+    assert stored_meta_costs(run_dir) == pytest.approx(paid)
+    paid += 0.01 * len(prompts)
+
+    # The state file holds the final summary, whose cost the database holds.
+    # Thus the resume makes the first update again, and not the final summary.
+    state = read_state(run_dir)
+    assert state["meta_recommendations_history"] == [
+        "1. Recommendation of launch 1 update 2."
+    ]
+    assert waiting_generations(state) == [0, 1]
+    second_llm = StubMetaLLM("launch 2")
+    second = launch(run_dir, second_llm, generations=[], meta_rec_interval=2)
+    assert second_llm.batches == [[0, 1]]
+    assert second.final_api_cost == pytest.approx(
+        paid + update_costs(second_llm.batches)
+    )
+    assert waiting_generations(read_state(run_dir)) == []
 
 
 @pytest.mark.parametrize("cost_write", ["fails each try", "is slow, then fails"])

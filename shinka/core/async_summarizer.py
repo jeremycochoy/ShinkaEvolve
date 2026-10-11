@@ -40,6 +40,8 @@ class MetaUpdate:
     global_insights: str
     recommendations: str
     cost: float
+    # True when the database holds the cost of the update
+    cost_stored: bool = False
 
 
 def apply_meta_update(state: MetaSummarizer, update: MetaUpdate) -> None:
@@ -102,13 +104,12 @@ class AsyncMetaSummarizer:
         self.sync_summarizer = sync_summarizer
         self.async_llm_client = async_llm_client
         self.state_path = state_path
-        # The updates of the state in memory whose cost the database does not
-        # hold: their cost write is in progress, or it failed. In the order
-        # of the updates
+        # The updates of the state in memory that the saved state does not
+        # hold: their cost write is in progress or failed, or they wait for
+        # the cost write of an earlier update. In the order of the updates
         self.unsaved_updates: List[MetaUpdate] = []
-        # With unsaved updates, the state that a save writes: the state from
-        # before the first unsaved update, and each later update whose cost
-        # the database holds
+        # With unsaved updates: the state from before the first unsaved
+        # update, and each later update that the saved state took
         self.saved_state = copy_meta_state(sync_summarizer)
         # The task of each cost write of a meta update
         self.cost_writes: List[asyncio.Task] = []
@@ -126,8 +127,8 @@ class AsyncMetaSummarizer:
         Perform 3-step meta-analysis and update internal state.
         A program with no step 1 answer stays in the waiting list.
         With store_cost, a task writes the cost of the update after the
-        update, and the caller does not wait for it. The cost writes run one
-        at a time, in the order of the updates.
+        update, and the caller does not wait for it. The saved state takes the
+        updates in their order.
         Returns tuple of (updated_recommendations, total_cost) or
         (None, 0.0) if no update occurred.
         """
@@ -242,19 +243,25 @@ class AsyncMetaSummarizer:
     ) -> None:
         """Write the cost of an update, then put the update into the saved state.
 
-        The task waits for the cost write of the update before it, thus the
+        The write does not wait for the cost write of the update before it,
+        thus a late write does not stop a later one. Then the task waits for
+        the task of the update before it, also after a failed write, thus the
         saved state takes the updates in their order. When each try fails, no
         save holds the update, and a later launch makes the update again.
         """
-        if previous is not None:
+        update.cost_stored = (
+            store_cost is None
+            or update.cost <= 0
+            or await self._try_cost_write(update, store_cost)
+        )
+        if previous is not None and not previous.done():
+            # A save holds an update exactly when the database holds its
+            # cost, also while the update waits: a stop then does not lose it
+            if update.cost_stored and self.state_path:
+                self.save_meta_state(self.state_path)
             await asyncio.wait([previous])
-        if (
-            store_cost is not None
-            and update.cost > 0
-            and not await self._try_cost_write(update, store_cost)
-        ):
-            return
-        self._store_update(update)
+        if update.cost_stored:
+            self._store_update(update)
 
     async def _try_cost_write(
         self,
@@ -590,15 +597,22 @@ class AsyncMetaSummarizer:
         """Save the meta state to a file (delegated to sync).
 
         The file holds each update whose cost the database holds, and no
-        other. The programs of an unsaved update wait in the file.
+        other, in the order of the updates. The programs of an other update
+        wait in the file.
         """
         if not self.unsaved_updates:
             return self.sync_summarizer.save_meta_state(filepath)
-        unsaved_programs = [p for u in self.unsaved_updates for p in u.programs]
-        self.saved_state.evaluated_since_last_meta = (
-            unsaved_programs + self.sync_summarizer.evaluated_since_last_meta
+        state = copy_meta_state(self.saved_state)
+        waiting: List[Program] = []
+        for update in self.unsaved_updates:
+            if update.cost_stored:
+                apply_meta_update(state, update)
+            else:
+                waiting.extend(update.programs)
+        state.evaluated_since_last_meta = (
+            waiting + self.sync_summarizer.evaluated_since_last_meta
         )
-        return self.saved_state.save_meta_state(filepath)
+        return state.save_meta_state(filepath)
 
     def load_meta_state(self, filepath: str) -> bool:
         """Load the meta state from a file (delegated to sync)."""
