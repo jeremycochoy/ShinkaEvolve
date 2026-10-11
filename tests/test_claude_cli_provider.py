@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import shinka.llm.client as llm_client
 from shinka.llm.client import get_async_client_llm, get_client_llm
 from shinka.llm.kwargs import sample_model_kwargs
 from shinka.llm.providers.claude_cli import (
@@ -120,6 +121,31 @@ def test_get_async_client_llm_returns_none_for_claude_cli():
     assert client is None
     assert provider == "claude_cli"
     assert name == "claude-cli/claude-fable-5"
+
+
+def test_client_cache_gives_no_client_to_claude_cli(monkeypatch):
+    # claude-cli runs the `claude` command: it has no SDK client, thus the
+    # client cache of the providers keeps no entry for it
+    monkeypatch.setattr(llm_client, "_SYNC_CLIENT_CACHE", {})
+    model_name = "claude-cli/claude-opus-4-8?effort=low"
+
+    async def get_async_clients():
+        clients = [
+            get_async_client_llm(model_name, structured_output=structured)
+            for structured in (False, True)
+        ]
+        loop = asyncio.get_running_loop()
+        return clients, getattr(loop, llm_client._ASYNC_CACHE_ATTRIBUTE, {})
+
+    clients, loop_cache = asyncio.run(get_async_clients())
+    clients += [
+        get_client_llm(model_name, structured_output=structured)
+        for structured in (False, True)
+    ]
+
+    assert clients == [(None, model_name, "claude_cli")] * 4
+    assert loop_cache == {}
+    assert llm_client._SYNC_CLIENT_CACHE == {}
 
 
 def test_claude_cli_kwargs_skip_api_only_parameters():

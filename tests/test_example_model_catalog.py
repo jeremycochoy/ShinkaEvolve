@@ -270,9 +270,12 @@ def test_example_model_literals_are_current(reference: ModelReference) -> None:
 def test_example_models_resolve_with_finite_pricing(reference: ModelReference) -> None:
     for prefix, expected_provider in EXTERNALLY_PRICED_PREFIXES.items():
         if reference.model_name.startswith(prefix):
-            resolved = resolve_model_backend(reference.model_name)
-            assert reference.kind == "llm"
-            assert resolved.provider == expected_provider
+            # The embedding resolver accepts a local model, but no headless model
+            if reference.kind == "embedding":
+                provider = resolve_embedding_backend(reference.model_name).provider
+            else:
+                provider = resolve_model_backend(reference.model_name).provider
+            assert provider == expected_provider
             return
 
     if reference.kind == "embedding":

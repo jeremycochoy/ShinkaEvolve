@@ -47,7 +47,7 @@ from shinka.prompts import (
     META_STEP2_SYSTEM_MSG,
     META_STEP3_SYSTEM_MSG,
 )
-from shinka.wandb_logging import PROGRAM_TABLE_KEY, ShinkaWandbLogger
+from shinka.wandb_logging import PROGRAM_TABLE_KEY, ShinkaWandbLogger, is_island_copy
 
 STATE_FILE = "meta_memory.json"
 EVAL_RESULTS = {
@@ -1130,6 +1130,7 @@ def record_wandb(patch) -> FakeWandbRun:
     wandb: Any = ModuleType("wandb")
     wandb.init = lambda **kwargs: run
     wandb.Table = SimpleNamespace
+    wandb.Settings = SimpleNamespace
     patch.setitem(sys.modules, "wandb", wandb)
     patch.setattr(
         async_runner, "ShinkaWandbLogger", lambda enabled: ShinkaWandbLogger(True)
@@ -1143,7 +1144,7 @@ def wandb_costs(run: FakeWandbRun) -> dict[int, dict[str, float]]:
         payload["generation"]: {
             key: round(value, 6)
             for key, value in payload.items()
-            if key.startswith("cost/")
+            if key.startswith("individual/cost/")
         }
         for payload in run.program_payloads()
     }
@@ -1276,13 +1277,17 @@ def test_wandb_gets_the_cost_of_an_update_whose_cost_write_tries_again(
     # program. The metadata write of that program keeps the meta cost of the
     # database. Thus the database holds no cost, and no save holds the update.
     (before,) = at_the_retry
-    assert {g: costs["cost/meta"] for g, costs in before.wandb.items()} == expected
+    assert {
+        g: costs["individual/cost/meta"] for g, costs in before.wandb.items()
+    } == expected
     assert before.stored == 0
     assert before.state is None or before.state["meta_recommendations_history"] == []
     # After the retry: W&B logged each program one time, with the same cost.
     # The database holds the cost one time, and the state file holds the
     # update.
-    assert {g: costs["cost/meta"] for g, costs in wandb_costs(run).items()} == expected
+    assert {
+        g: costs["individual/cost/meta"] for g, costs in wandb_costs(run).items()
+    } == expected
     assert len(run.program_payloads()) == len(expected)
     assert stored_meta_costs(run_dir) == pytest.approx(paid)
     assert len(stored_update_ids(run_dir)) == 1
@@ -1298,6 +1303,47 @@ def test_wandb_gets_the_cost_of_an_update_whose_cost_write_tries_again(
     assert sum(row[-1] for row in table.data) == pytest.approx(paid)
     assert run.summary["run/total_api_cost"] == pytest.approx(paid)
     assert result.final_api_cost == pytest.approx(paid)
+
+
+@pytest.mark.parametrize("db_path", ["programs.sqlite", None], ids=["file", "memory"])
+def test_final_wandb_snapshot_merges_the_live_meta_costs(tmp_path, monkeypatch, db_path):
+    run = record_wandb(monkeypatch)
+    runner = make_runner(tmp_path / "run", None, 1)
+    runner.wandb_logger.start(
+        evo_config=runner.evo_config,
+        db_config=runner.db_config,
+        job_config=runner.job_config,
+        results_dir=tmp_path,
+    )
+    # The database holds the cost of update 1. The cost write of update 2
+    # failed, thus only the live costs hold that cost. The island copy of the
+    # program repeats both costs.
+    db = ProgramDatabase(
+        DatabaseConfig(db_path=str(tmp_path / db_path) if db_path else None)
+    )
+    metadata = {"api_costs": 0.01, "meta_cost": 0.03, "meta_cost_update_ids": ["1"]}
+    db.add(Program(id="program", code="", metadata=metadata), defer_maintenance=True)
+    db.add(
+        Program(id="copy", code="", metadata={**metadata, "_is_island_copy": True}),
+        defer_maintenance=True,
+    )
+    runner.db = db
+    live_costs = {"1": 0.03, "2": 0.05}
+    runner.live_meta_costs = {"program": dict(live_costs), "copy": dict(live_costs)}
+
+    asyncio.run(runner._finish_wandb_logging())
+    db.close()
+
+    # With a database file, a worker thread reads the programs from the file.
+    # With a database in memory, the runner reads them. In each case, the
+    # final W&B row and the final table merge the live costs with the costs of
+    # the database by update id: each cost counts 1 time. A copy shows no
+    # cost, as on SakanaAI main.
+    final_row, final_table = run.payloads[-2:]
+    assert final_row["cost/meta"] == pytest.approx(0.08)
+    assert final_row["cost/total"] == pytest.approx(0.09)
+    rows = final_table[PROGRAM_TABLE_KEY].data
+    assert {row[0]: round(row[-1], 6) for row in rows} == {"program": 0.09, "copy": 0}
 
 
 def record_final_console_summaries(patch) -> list[str]:
@@ -1327,17 +1373,13 @@ def console_costs(text: str) -> dict[str, float]:
     }
 
 
-def final_table_meta_costs(
-    run: FakeWandbRun, run_dir: Path, with_copies: bool = False
-) -> dict:
+def final_table_meta_costs(run: FakeWandbRun, run_dir: Path) -> dict:
     """Give the meta cost of each evaluated program in the last final W&B table.
 
     A row of the table gives the sum of the costs of its program. The meta
     cost is that sum less the other costs, which the database holds. The
-    result is by generation. As on main, the copy of the initial program has
-    no meta cost. With with_copies, the result also gives the meta cost of
-    each island copy, by generation and island: a new island copies the
-    metadata of its program, thus that copy can have a meta cost.
+    result is by generation. As on SakanaAI main, the row of an island copy
+    has no cost: the row of its program has the costs.
     """
     tables = [p[PROGRAM_TABLE_KEY] for p in run.payloads if PROGRAM_TABLE_KEY in p]
     row_costs = {row[0]: row[-1] for row in tables[-1].data}
@@ -1351,6 +1393,9 @@ def final_table_meta_costs(
     assert set(row_costs) == {p.id for p in programs}
     meta_costs = {}
     for program in programs:
+        if is_island_copy(program):
+            assert row_costs[program.id] == 0, program.metadata
+            continue
         other_costs = sum(
             program.metadata.get(key) or 0.0
             for key in ("api_costs", "embed_cost", "novelty_cost")
@@ -1358,8 +1403,6 @@ def final_table_meta_costs(
         meta_cost = round(row_costs[program.id] - other_costs, 6)
         if program.id in evaluated_ids:
             meta_costs[program.generation] = meta_cost
-        elif with_copies:
-            meta_costs[(program.generation, program.island_idx)] = meta_cost
         else:
             assert meta_cost == 0, program.metadata
     return meta_costs
@@ -1687,8 +1730,8 @@ def final_readers_with_dynamic_islands(
 ) -> dict:
     """Run one launch with dynamic islands, with the failure point of a cost write.
 
-    Return the meta cost of each row of the final W&B table, and the totals
-    of the final console summary.
+    Return the meta cost of each evaluated program in the final W&B table, and
+    the totals of the final console summary.
     """
     interval, _, scores, _ = ISLAND_COPY_PATHS[path]
     with monkeypatch.context() as patch:
@@ -1706,7 +1749,7 @@ def final_readers_with_dynamic_islands(
         )
     (text,) = texts
     return {
-        "table": final_table_meta_costs(run, run_dir, with_copies=True),
+        "table": final_table_meta_costs(run, run_dir),
         "console": console_costs(text),
     }
 
@@ -1727,13 +1770,19 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     )
 
     # The new island 1 copies the program of the update after the update. As
-    # on main, the copy repeats the cost that its program has at that time.
+    # on main, the copy repeats the cost that its program has at that time, in
+    # the database and in the console summary. As on SakanaAI main, the final
+    # W&B table gives no cost to the copy.
     copy_key = (update_generation, 1)
-    assert 0 < reference["table"][copy_key] <= reference["table"][update_generation]
+    stored = stored_meta_costs_by_generation(tmp_path / "reference", with_copies=True)
+    assert 0 < stored[copy_key] <= stored[update_generation]
+    assert reference["console"]["Total Meta Cost"] == pytest.approx(
+        round(sum(stored.values()), 2)
+    )
     # main writes the cost of an update of the setup or of a job with the
     # metadata of its program, and a new island copies that metadata. Thus a
     # cost write changes no row of the final table and no console summary of
-    # main, also the row of the copy.
+    # main, also the cost of the copy.
     assert result == reference
 
     # A resume. Its final readers show the costs of the database. When the
@@ -1746,7 +1795,7 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
         run_dir, monkeypatch, path, "launch 2", []
     )
     stored = stored_meta_costs_by_generation(run_dir, with_copies=True)
-    assert resume["table"] == stored
+    assert resume["table"] == stored_meta_costs_by_generation(run_dir)
     assert resume["console"]["Total Meta Cost"] == pytest.approx(
         round(sum(stored.values()), 2)
     )
@@ -2905,7 +2954,7 @@ def test_metadata_write_of_the_runner_keeps_the_meta_costs_of_the_database(
     # W&B gets it. Each cost write fails: the metadata write of that program
     # puts no meta cost into the database, and no save holds the update.
     paid = round(update_costs(meta_llm.batches), 6)
-    assert wandb_costs(run)[1]["cost/meta"] == paid
+    assert wandb_costs(run)[1]["individual/cost/meta"] == paid
     config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
     db = ProgramDatabase(config=config, embedding_model="", read_only=True)
     try:
