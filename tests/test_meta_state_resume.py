@@ -1021,17 +1021,23 @@ def fail_cost_writes(patch) -> None:
     patch.setattr(ProgramDatabase, "add_meta_cost", locked_cost_write)
 
 
-def fail_the_first_cost_writes(patch, count: int) -> list:
-    """Make the first count writes of a meta cost fail, and the later succeed.
+def fail_the_first_tries_of_the_first_update(patch, count: int) -> list:
+    """Make the first count tries of the cost write of the first meta update fail.
 
-    Returns the list of the arguments of each write.
+    The later tries and the cost writes of the other updates succeed. The
+    cost writes of 2 updates can occur at the same time, thus a write of a
+    later update can come between 2 tries of the first update. The first
+    update is the update of the first write. Returns the list of the
+    arguments of each write.
     """
     add_meta_cost = ProgramDatabase.add_meta_cost
     calls = []
 
     def fail_then_write(db, *args):
         calls.append(args)
-        if len(calls) <= count:
+        first_update_id = calls[0][-1]
+        tries = [call for call in calls if call[-1] == first_update_id]
+        if args[-1] == first_update_id and len(tries) <= count:
             raise sqlite3.OperationalError("database is locked")
         return add_meta_cost(db, *args)
 
@@ -1182,8 +1188,8 @@ def retry_the_first_cost_write_after_the_wandb_log(patch, run, run_dir) -> list:
 
 # The failure points of the cost write of a meta update.
 COST_WRITE_FAILURES = {
-    "fails 1 time": partial(fail_the_first_cost_writes, count=1),
-    "fails 3 times": lambda patch: fail_the_first_cost_writes(
+    "fails 1 time": partial(fail_the_first_tries_of_the_first_update, count=1),
+    "fails 3 times": lambda patch: fail_the_first_tries_of_the_first_update(
         patch, async_summarizer.META_COST_WRITE_TRIES
     ),
     "fails each time": fail_cost_writes,
@@ -1531,8 +1537,8 @@ def check_each_save(patch, run_dir: Path) -> list[list[str]]:
 
 # The failure points of a cost write, for the final readers of the costs.
 FINAL_READER_FAILURES: dict[str, Callable[[Any], Any]] = {
-    "fails 1 time": partial(fail_the_first_cost_writes, count=1),
-    "fails 3 times": lambda patch: fail_the_first_cost_writes(
+    "fails 1 time": partial(fail_the_first_tries_of_the_first_update, count=1),
+    "fails 3 times": lambda patch: fail_the_first_tries_of_the_first_update(
         patch, async_summarizer.META_COST_WRITE_TRIES
     ),
     "is slow": commit_each_cost_write_late,
@@ -2652,7 +2658,9 @@ def test_failed_cost_write_of_a_resume_leaves_the_next_update_to_the_state_file(
     # job of generation 3 makes the next update, whose cost write commits.
     meta_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
-        fail_the_first_cost_writes(patch, async_summarizer.META_COST_WRITE_TRIES)
+        fail_the_first_tries_of_the_first_update(
+            patch, async_summarizer.META_COST_WRITE_TRIES
+        )
         launch(run_dir, meta_llm, generations=[2, 3], meta_rec_interval=2)
 
     # The updates are the updates of main.
@@ -2892,7 +2900,7 @@ def test_failed_cost_write_is_written_again_with_the_same_update_id(
     # The first cost write of launch 1 fails. The later writes succeed.
     first_llm = StubMetaLLM("launch 1")
     with monkeypatch.context() as patch:
-        calls = fail_the_first_cost_writes(patch, 1)
+        calls = fail_the_first_tries_of_the_first_update(patch, 1)
         first = launch(run_dir, first_llm, generations, meta_rec_interval=interval)
 
     # The update writes its cost again with the same update id and no new LLM
