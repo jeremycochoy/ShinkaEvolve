@@ -3,14 +3,18 @@ from pydantic import BaseModel
 from .client import get_client_llm, get_async_client_llm
 from .providers import (
     query_anthropic,
+    query_claude_cli,
     query_openai,
     query_deepseek,
     query_gemini,
+    query_headless,
     query_local_openai,
     query_anthropic_async,
+    query_claude_cli_async,
     query_openai_async,
     query_deepseek_async,
     query_gemini_async,
+    query_headless_async,
     query_local_openai_async,
     QueryResult,
 )
@@ -42,6 +46,10 @@ def query(
         query_fn = query_gemini
     elif provider == "local_openai":
         query_fn = query_local_openai
+    elif provider == "headless":
+        query_fn = query_headless
+    elif provider == "claude_cli":
+        query_fn = query_claude_cli
     else:
         raise ValueError(f"Model {model_name} not supported.")
     result = query_fn(
@@ -80,6 +88,10 @@ async def query_async(
         query_fn = query_gemini_async
     elif provider == "local_openai":
         query_fn = query_local_openai_async
+    elif provider == "headless":
+        query_fn = query_headless_async
+    elif provider == "claude_cli":
+        query_fn = query_claude_cli_async
     else:
         raise ValueError(f"Model {model_name} not supported.")
     result = await query_fn(

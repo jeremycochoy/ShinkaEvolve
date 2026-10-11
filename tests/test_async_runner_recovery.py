@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -239,6 +240,27 @@ def test_get_in_flight_work_count_includes_completed_job_processing_lock():
             runner.processing_lock.release()
 
     asyncio.run(_run())
+
+
+def test_get_failure_language_infers_fortran_from_generated_filename():
+    runner = _build_runner(evo_config=SimpleNamespace(language=None))
+
+    assert runner._get_failure_language(Path("main.f90")) == "fortran"
+    assert runner._get_failure_language(Path("main.f95")) == "fortran"
+    assert runner._get_failure_language(Path("main.f03")) == "fortran"
+    assert runner._get_failure_language(Path("main.f08")) == "fortran"
+
+
+def test_get_failure_language_infers_go_from_generated_filename():
+    runner = _build_runner(evo_config=SimpleNamespace(language=None))
+
+    assert runner._get_failure_language(Path("main.go")) == "go"
+
+
+def test_get_failure_language_infers_verilog_from_generated_filename():
+    runner = _build_runner(evo_config=SimpleNamespace(language=None))
+
+    assert runner._get_failure_language(Path("main.sv")) == "verilog"
 
 
 def test_job_monitor_stops_when_target_reached_with_no_running_jobs():

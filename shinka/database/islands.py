@@ -516,6 +516,9 @@ class CombinedIslandManager:
         self.migration_strategy = migration_strategy or (
             ElitistMigrationStrategy(cursor, conn, config)
         )
+        # The source program id of each island copy that this manager made,
+        # by copy id
+        self.copy_sources: Dict[str, str] = {}
 
     def assign_island(self, program: Any) -> None:
         """Assign an island to a program using the configured strategy."""
@@ -678,6 +681,7 @@ class CombinedIslandManager:
                 ),
             )
             created_ids.append(new_id)
+            self.copy_sources[new_id] = program.id
             logger.info(
                 f"Created copy {new_id[:8]}... of program {program.id[:8]}... "
                 f"for island {island_idx}"
@@ -882,6 +886,7 @@ class CombinedIslandManager:
                 (new_parent_id,),
             )
 
+        self.copy_sources[new_id] = source_program["id"]
         return new_id
 
     def _get_correct_children(

@@ -18,6 +18,8 @@
 
 ---
 
+**May 2026 Update**: Added [Headless](https://github.com/RobertTLange/headless-cli) CLI-backed mutation models for subscription-backed agent usage. Use model strings such as `headless/codex@gpt-5.5?effort=high` or `headless/claude`. Check the [example](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/sine_approx_headless) for more detail.
+
 **Apr 2026 Update**: Added the new [documentation website](https://sakanaai.github.io/ShinkaEvolve/) with guides for getting started, configuration, async evolution, local models, WebUI usage, and agentic workflows.
 
 **Mar 2026 Update**: Refactored API and unified runner `ShinkaEvolveRunner` (replacing `EvolutionRunner` and `AsyncEvolutionRunner`). You can now install `shinka` via PyPI and `uv`: `pip install shinka-evolve`.
@@ -101,7 +103,11 @@ For detailed installation instructions and usage examples, see the [Getting Star
 | ⭕ [Circle Packing](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/circle_packing) | Optimize circle packing to maximize radii. | `LocalJobConfig` |
 | 🎮 [Game 2048](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/game_2048) | Optimize a policy for the Game of 2048. | `LocalJobConfig` |
 | ∑ [Julia Prime Counting](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/julia_prime_counting) | Optimize a Julia solver for prime-count queries. | `LocalJobConfig` |
+| 🔥 [Fortran Heat Diffusion](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/fortran_heat_diffusion) | Optimize a compiled Fortran stencil solver. | `LocalJobConfig` |
+| 🧮 [Wolfram GCD Sum](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/wolfram_gcd_sum) | Optimize a Wolfram Language GCD-sum solver. | `LocalJobConfig` |
 | ✨ [Novelty Generator](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/novelty_generator) | Generate creative, surprising outputs (e.g., ASCII art). | `LocalJobConfig` |
+| ∿ [Sine Approx Headless](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/sine_approx_headless) | Evolve a bounded sine approximation using Headless subscription-backed mutation calls. | `LocalJobConfig` |
+| ⚡ [RTLLM PPA](https://github.com/SakanaAI/ShinkaEvolve/tree/main/examples/rtllm) | Evolve Verilog RTL for power/performance/area under a fixed spec (RTLLM v2.0). Requires `iverilog` + `yosys` + `OpenSTA`. | `LocalJobConfig` |
 
 
 ## `shinka` Run with Python API 🐍
@@ -154,6 +160,46 @@ runner = ShinkaEvolveRunner(
 runner.run()
 ```
 
+### Live model pricing
+
+Shinka refreshes supported model metadata and token prices from
+[`models.dev`](https://models.dev) when a new run starts. Requests use HTTP
+cache validation, then fall back to the last validated user-cache response or
+the packaged snapshot when offline. The exact catalog used by a run is written
+to `pricing_snapshot.json` in its results directory and reused when that run is
+resumed.
+
+Set `SHINKA_PRICING_MODE=offline` to skip the network check, or
+`SHINKA_PRICING_MODE=required` to fail startup when live pricing cannot be
+validated. Run `shinka_models --verbose` to inspect catalog provenance and the
+models available for configured provider credentials.
+
+### Weights & Biases logging
+
+Install the optional W&B integration and enable it for a run:
+
+```bash
+pip install 'shinka-evolve[wandb]'
+
+# Authenticate online runs. In CI, provide this through a secret manager.
+export WANDB_API_KEY=<your-api-key>
+
+shinka_run --task-dir examples/circle_packing \
+  --results_dir results/circle_wandb \
+  --num_generations 20 \
+  --set evo.enable_wandb_logging=true \
+  --set evo.wandb_project=shinka-evolve
+```
+
+W&B logging is additive: the existing SQLite database and WebUI logging remain
+enabled. Each evaluated individual logs `score/individual` against `generation`,
+along with compact evaluation, cost, and timing metrics. Resuming the same
+results directory reuses its persisted W&B run ID by default. Online mode uses
+the credentials from `wandb login` or `WANDB_API_KEY`; use `wandb_mode=offline`
+to record locally without uploading. See
+[Configuration](docs/configuration.md#evolutionconfig-shinkacoreconfigevolutionconfig)
+for all W&B options.
+
 <details>
 <summary><strong>EvolutionConfig Parameters</strong> (click to expand)</summary>
 
@@ -181,6 +227,18 @@ Class defaults below come from `shinka/core/config.py` (`EvolutionConfig`). Hydr
 | `embedding_model` | `"text-embedding-3-small"` | `Optional[str]` | Model for code embeddings. Also accepts `local/<model>@http(s)://host[:port]/v1` for local OpenAI-compatible embedding servers, with optional `?api_key_env=ENV_VAR` for per-model credentials. |
 | `init_program_path` | `"initial.py"` | `Optional[str]` | Path to initial program to evolve |
 | `results_dir` | `None` | `Optional[str]` | Directory to save results (auto-generated if None) |
+| `enable_wandb_logging` | `False` | `bool` | Mirror evolution metrics to W&B without disabling SQLite or WebUI logging |
+| `wandb_project` | `"shinka-evolve"` | `Optional[str]` | W&B project used when logging is enabled |
+| `wandb_entity` | `None` | `Optional[str]` | Optional W&B entity or team |
+| `wandb_group` | `None` | `Optional[str]` | Optional W&B run group |
+| `wandb_name` | `None` | `Optional[str]` | Optional run name; defaults to the results directory name |
+| `wandb_mode` | `None` | `Optional[str]` | Optional W&B mode such as `offline` or `disabled` |
+| `wandb_tags` | `[]` | `List[str]` | Optional W&B tags |
+| `wandb_notes` | `None` | `Optional[str]` | Optional W&B run notes |
+| `wandb_dir` | `None` | `Optional[str]` | Optional local W&B directory; defaults to `results_dir` |
+| `wandb_run_id` | `None` | `Optional[str]` | Optional W&B run ID; otherwise generated and persisted in the results directory |
+| `wandb_resume` | `"allow"` | `str` | W&B resume policy used with the persisted run ID |
+| `wandb_config` | `{}` | `Dict[str, Any]` | Extra values merged into the W&B run config |
 | `max_novelty_attempts` | `3` | `int` | Max attempts for novelty generation |
 | `code_embed_sim_threshold` | `0.99` | `float` | Similarity threshold for code embeddings |
 | `novelty_llm_models` | `None` | `Optional[List[str]]` | LLM models for novelty judgment |
@@ -424,6 +482,29 @@ shinka_run \
 `--config-fname` can define `evo/db/job` (or `evo_config/db_config/job_config`) plus `max_evaluation_jobs/max_proposal_jobs/max_db_workers` and `verbose/debug`.  
 Precedence: config YAML < `--set` < authoritative flags.  
 `--results_dir` and `--num_generations` are authoritative and always override config/`--set` values for `evo.results_dir` and `evo.num_generations`.
+
+### Headless Agent Models
+
+Use `headless/<agent>` model strings to route mutation calls through the local Headless CLI instead of provider API clients. Shinka uses `npx -y @roberttlange/headless` by default and runs `headless --check` before evolution starts.
+
+```bash
+shinka_run \
+    --task-dir examples/sine_approx_headless \
+    --results_dir results/sine_approx_headless \
+    --num_generations 5 \
+    --max-evaluation-jobs 1 \
+    --max-proposal-jobs 1 \
+    --set evo.llm_models='["headless/codex@gpt-5.5?effort=high"]' \
+    --set evo.embedding_model=null \
+    --set evo.patch_types='["full", "diff"]' \
+    --set evo.patch_type_probs='[0.5, 0.5]'
+```
+
+For a Python runner using both Codex and Claude through Headless:
+
+```bash
+python examples/sine_approx_headless/run_evo.py
+```
 
 
 ## Interactive WebUI 🎨

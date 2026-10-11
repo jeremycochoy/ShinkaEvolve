@@ -121,6 +121,130 @@ def test_shinka_run_happy_path_with_authoritative_overrides(tmp_path, monkeypatc
     assert "def main" in evaluate_str
 
 
+@pytest.mark.parametrize("extension", [".f90", ".f95", ".f03", ".f08"])
+def test_shinka_run_infers_fortran_initial_extensions(
+    tmp_path,
+    monkeypatch,
+    extension,
+):
+    _reset_dummy_runner()
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "initial.py").unlink()
+    (task_dir / f"initial{extension}").write_text(
+        "! EVOLVE-BLOCK-START\n"
+        "integer function run()\n"
+        "    run = 0\n"
+        "end function run\n"
+        "! EVOLVE-BLOCK-END\n",
+        encoding="utf-8",
+    )
+    results_dir = tmp_path / f"results_fortran_{extension[1:]}"
+    monkeypatch.setattr(cli_run, "ShinkaEvolveRunner", _DummyRunner)
+
+    exit_code = cli_run.main(
+        [
+            "--task-dir",
+            str(task_dir),
+            "--results_dir",
+            str(results_dir),
+            "--num_generations",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    evo_config = _DummyRunner.last_kwargs["evo_config"]
+    assert evo_config.language == "fortran"
+    assert evo_config.init_program_path.endswith(f"initial{extension}")
+
+
+def test_shinka_run_infers_go_initial_extension(tmp_path, monkeypatch):
+    _reset_dummy_runner()
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "initial.py").unlink()
+    (task_dir / "initial.go").write_text(
+        "// EVOLVE-BLOCK-START\n"
+        "func run() int { return 0 }\n"
+        "// EVOLVE-BLOCK-END\n",
+        encoding="utf-8",
+    )
+    results_dir = tmp_path / "results_go"
+    monkeypatch.setattr(cli_run, "ShinkaEvolveRunner", _DummyRunner)
+
+    exit_code = cli_run.main(
+        [
+            "--task-dir",
+            str(task_dir),
+            "--results_dir",
+            str(results_dir),
+            "--num_generations",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    evo_config = _DummyRunner.last_kwargs["evo_config"]
+    assert evo_config.language == "go"
+    assert evo_config.init_program_path.endswith("initial.go")
+
+
+def test_shinka_run_infers_verilog_initial_extension(tmp_path, monkeypatch):
+    _reset_dummy_runner()
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "initial.py").unlink()
+    (task_dir / "initial.sv").write_text(
+        "// EVOLVE-BLOCK-START\n"
+        "module main;\n"
+        "endmodule\n"
+        "// EVOLVE-BLOCK-END\n",
+        encoding="utf-8",
+    )
+    results_dir = tmp_path / "results_verilog"
+    monkeypatch.setattr(cli_run, "ShinkaEvolveRunner", _DummyRunner)
+
+    exit_code = cli_run.main(
+        [
+            "--task-dir",
+            str(task_dir),
+            "--results_dir",
+            str(results_dir),
+            "--num_generations",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    evo_config = _DummyRunner.last_kwargs["evo_config"]
+    assert evo_config.language == "verilog"
+    assert evo_config.init_program_path.endswith("initial.sv")
+
+
+def test_shinka_run_prefers_python_over_fortran_initial(tmp_path):
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "initial.f90").write_text(
+        "! EVOLVE-BLOCK-START\n"
+        "integer function run()\n"
+        "    run = 0\n"
+        "end function run\n"
+        "! EVOLVE-BLOCK-END\n",
+        encoding="utf-8",
+    )
+
+    assert cli_run._detect_initial_program(task_dir) == task_dir / "initial.py"
+
+
+def test_shinka_run_prefers_python_over_go_initial(tmp_path):
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "initial.go").write_text(
+        "// EVOLVE-BLOCK-START\n"
+        "func run() int { return 0 }\n"
+        "// EVOLVE-BLOCK-END\n",
+        encoding="utf-8",
+    )
+
+    assert cli_run._detect_initial_program(task_dir) == task_dir / "initial.py"
+
+
 def test_shinka_run_parses_json_overrides(tmp_path, monkeypatch):
     _reset_dummy_runner()
     task_dir = _make_task_dir(tmp_path)

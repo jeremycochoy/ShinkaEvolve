@@ -176,3 +176,81 @@ def test_perform_final_summary_writes_output_file(tmp_path):
     assert "# INDIVIDUAL PROGRAM SUMMARIES" in output_text
     assert "# GLOBAL INSIGHTS SCRATCHPAD" in output_text
     assert "# META RECOMMENDATIONS" in output_text
+
+
+def test_meta_state_keeps_the_ids_of_the_processed_programs(tmp_path):
+    llm_client = DummyMetaLLM(
+        batch_responses=[
+            DummyResponse(content="Summary for generation 2"),
+            DummyResponse(content="Summary for generation 1"),
+        ],
+        query_responses=[
+            DummyResponse(content="Global insight block"),
+            DummyResponse(content="1. Recommendation A"),
+        ],
+    )
+    summarizer = MetaSummarizer(meta_llm_client=llm_client)
+    summarizer.add_evaluated_program(make_program("prog-2", generation=2))
+    summarizer.add_evaluated_program(make_program("prog-1", generation=1))
+    summarizer.update_meta_memory()
+    summarizer.add_evaluated_program(make_program("prog-3", generation=3))
+
+    state_path = tmp_path / "state.json"
+    summarizer.save_meta_state(str(state_path))
+    loaded = MetaSummarizer()
+    assert loaded.load_meta_state(str(state_path))
+
+    assert loaded.processed_program_ids == ["prog-2", "prog-1"]
+    assert [p.id for p in loaded.evaluated_since_last_meta] == ["prog-3"]
+
+
+def test_add_unknown_programs_skips_the_programs_of_the_state():
+    summarizer = MetaSummarizer()
+    summarizer.processed_program_ids = ["prog-0"]
+    summarizer.total_programs_processed = 1
+    summarizer.add_evaluated_program(make_program("prog-2", generation=2))
+
+    summarizer.add_unknown_programs(
+        [make_program(f"prog-{generation}", generation) for generation in range(4)]
+    )
+
+    assert summarizer.processed_program_ids == ["prog-0"]
+    waiting_ids = [p.id for p in summarizer.evaluated_since_last_meta]
+    assert waiting_ids == ["prog-2", "prog-1", "prog-3"]
+
+
+def test_add_unknown_programs_with_a_state_from_before_the_ids():
+    # An older state file holds the count of its processed programs, not their ids.
+    summarizer = MetaSummarizer()
+    summarizer.total_programs_processed = 2
+    summarizer.add_evaluated_program(make_program("prog-2", generation=2))
+    # The evaluations of generations 1 and 3 ended out of order.
+    programs = [
+        make_program(f"prog-{generation}", generation) for generation in range(5)
+    ]
+    for program, timestamp in zip(programs, [10.0, 13.0, 12.0, 11.0, 14.0]):
+        program.timestamp = timestamp
+
+    summarizer.add_unknown_programs(programs)
+
+    # The 2 processed programs are the first 2 that the search evaluated.
+    assert summarizer.processed_program_ids == ["prog-0", "prog-3"]
+    waiting_ids = [p.id for p in summarizer.evaluated_since_last_meta]
+    assert waiting_ids == ["prog-2", "prog-1", "prog-4"]
+
+
+def test_rule_for_a_state_from_before_the_ids_applies_one_time():
+    # The count of an older state file can be above the programs of the database.
+    summarizer = MetaSummarizer()
+    summarizer.total_programs_processed = 9
+    programs = [
+        make_program(f"prog-{generation}", generation) for generation in range(3)
+    ]
+    summarizer.add_unknown_programs(programs)
+    assert summarizer.processed_program_ids == ["prog-0", "prog-1", "prog-2"]
+
+    # A later resume finds one more program in the database.
+    summarizer.add_unknown_programs([*programs, make_program("prog-3", generation=3)])
+
+    assert summarizer.processed_program_ids == ["prog-0", "prog-1", "prog-2"]
+    assert [p.id for p in summarizer.evaluated_since_last_meta] == ["prog-3"]

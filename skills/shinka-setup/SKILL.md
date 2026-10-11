@@ -86,6 +86,7 @@ Shinka supports multiple candidate-program languages. Choose one, then keep exte
 |---|---|
 | `python` | `initial.py` |
 | `julia` | `initial.jl` |
+| `fortran` | `initial.f90` |
 | `cpp` | `initial.cpp` |
 | `cuda` | `initial.cu` |
 | `rust` | `initial.rs` |

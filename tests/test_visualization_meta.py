@@ -26,6 +26,28 @@ def _make_handler(search_root: Path):
     return handler
 
 
+def test_failed_node_language_infers_verilog_from_suffix(tmp_path):
+    handler = _make_handler(tmp_path)
+
+    assert handler._language_from_suffix(".sv") == "verilog"
+
+
+def test_failed_node_code_path_prefers_verilog_extension(tmp_path):
+    handler = _make_handler(tmp_path)
+    failure_dir = tmp_path / "results" / "gen_1"
+    failure_dir.mkdir(parents=True)
+    expected_path = failure_dir / "main.sv"
+    expected_path.write_text("module main; endmodule\n", encoding="utf-8")
+    (failure_dir / "main.py").write_text("print('fallback')\n", encoding="utf-8")
+
+    code_path = handler._resolve_failed_node_code_path(
+        {"failure_json_path": "results/gen_1/failure.json"},
+        {"language": "verilog"},
+    )
+
+    assert code_path == expected_path
+
+
 def test_handle_get_meta_files_returns_processed_counts(tmp_path):
     results_dir = tmp_path / "results"
     meta_dir = results_dir / "meta"
@@ -330,6 +352,164 @@ def test_handle_get_program_details_loads_failed_non_python_node_with_language_f
     assert sent["data"]["id"] == "failed:proposal:8"
     assert sent["data"]["language"] == "javascript"
     assert sent["data"]["code"] == "console.log('candidate');\n"
+
+
+def test_handle_get_program_details_infers_failed_fortran_node_from_suffix(
+    tmp_path,
+):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(parents=True)
+    db_path = results_dir / "programs.sqlite"
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE programs (
+            id TEXT PRIMARY KEY,
+            code TEXT,
+            generation INTEGER,
+            correct INTEGER,
+            combined_score REAL,
+            timestamp REAL,
+            metadata TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE metadata_store (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE attempt_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation INTEGER NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            details TEXT,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    gen_dir = results_dir / "gen_9"
+    gen_dir.mkdir(parents=True)
+    (gen_dir / "main.f90").write_text(
+        "program main\nend program main\n",
+        encoding="utf-8",
+    )
+    (gen_dir / "failure.json").write_text(
+        '{"artifacts":{"generated_code_path":"results/gen_9/main.f90"}}',
+        encoding="utf-8",
+    )
+    conn.execute(
+        "INSERT INTO attempt_log (generation, stage, status, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            9,
+            "proposal",
+            "failed",
+            '{"node_kind":"failed_proposal","failure_stage":"proposal","failure_class":"llm_output_invalid","failure_reason":"proposal failed","failure_json_path":"results/gen_9/failure.json"}',
+            140.0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    handler = _make_handler(tmp_path)
+    sent = {}
+    handler.send_json_response = lambda data: sent.setdefault("data", data)
+    handler.send_error = lambda code, msg: sent.setdefault("error", (code, msg))
+
+    handler.handle_get_program_details(
+        "results/programs.sqlite", "failed:proposal:9"
+    )
+
+    assert "error" not in sent
+    assert sent["data"]["id"] == "failed:proposal:9"
+    assert sent["data"]["language"] == "fortran"
+    assert sent["data"]["code"] == "program main\nend program main\n"
+
+
+def test_handle_get_program_details_infers_failed_go_node_from_suffix(
+    tmp_path,
+):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(parents=True)
+    db_path = results_dir / "programs.sqlite"
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE programs (
+            id TEXT PRIMARY KEY,
+            code TEXT,
+            generation INTEGER,
+            correct INTEGER,
+            combined_score REAL,
+            timestamp REAL,
+            metadata TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE metadata_store (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE attempt_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation INTEGER NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            details TEXT,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    gen_dir = results_dir / "gen_10"
+    gen_dir.mkdir(parents=True)
+    (gen_dir / "main.go").write_text(
+        "package main\nfunc main() {}\n",
+        encoding="utf-8",
+    )
+    (gen_dir / "failure.json").write_text(
+        '{"artifacts":{"generated_code_path":"results/gen_10/main.go"}}',
+        encoding="utf-8",
+    )
+    conn.execute(
+        "INSERT INTO attempt_log (generation, stage, status, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            10,
+            "proposal",
+            "failed",
+            '{"node_kind":"failed_proposal","failure_stage":"proposal","failure_class":"llm_output_invalid","failure_reason":"proposal failed","failure_json_path":"results/gen_10/failure.json"}',
+            150.0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    handler = _make_handler(tmp_path)
+    sent = {}
+    handler.send_json_response = lambda data: sent.setdefault("data", data)
+    handler.send_error = lambda code, msg: sent.setdefault("error", (code, msg))
+
+    handler.handle_get_program_details(
+        "results/programs.sqlite", "failed:proposal:10"
+    )
+
+    assert "error" not in sent
+    assert sent["data"]["id"] == "failed:proposal:10"
+    assert sent["data"]["language"] == "go"
+    assert sent["data"]["code"] == "package main\nfunc main() {}\n"
 
 
 def test_handle_get_database_stats_uses_best_correct_program(tmp_path):
