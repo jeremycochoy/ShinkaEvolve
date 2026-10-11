@@ -83,6 +83,9 @@ META_STATE_FILENAME = "meta_memory.json"
 # Seconds for the final meta summary, for the meta update of a resume, and for
 # the wait for the meta cost writes at the end of a launch
 META_SUMMARY_TIMEOUT = 600.0
+# Seconds for the cost write of the final summary outside the write queue (the
+# busy timeout of the database)
+META_FINAL_COST_WRITE_TIMEOUT = 60.0
 
 
 def _print_gradient_logo_and_mirror(
@@ -565,6 +568,8 @@ class ShinkaEvolveRunner:
         self.live_meta_costs: Dict[str, Dict[str, float]] = {}
         # The island copies of the launch that repeat a live meta cost
         self.copies_with_live_costs: Set[str] = set()
+        # The program and the update id of the cost write of the final summary
+        self.final_meta_cost_write: Optional[Tuple[Program, str]] = None
 
         # In-flight cost estimation for accurate budget enforcement
         self.completed_proposal_costs: List[
@@ -711,7 +716,11 @@ class ShinkaEvolveRunner:
         )
 
     async def _store_meta_cost(
-        self, program: Program, meta_cost: float, update_id: str
+        self,
+        program: Program,
+        meta_cost: float,
+        update_id: str,
+        outside_the_queue: bool = False,
     ) -> None:
         """Add the cost of a meta update to the metadata of a program in the database.
 
@@ -722,10 +731,17 @@ class ShinkaEvolveRunner:
         program, the update of a resume writes to a waiting program. The write
         waits in the write queue of the database, and the database adds the
         cost to its own value in one transaction, one time for each update id.
+        With outside_the_queue, the write runs in a separate worker, with 1 try
+        and a time limit (see _store_final_meta_cost_outside_the_queue()).
         """
-        stored = await self.async_db.add_meta_cost_async(
-            program.id, meta_cost, update_id
-        )
+        if outside_the_queue:
+            stored = await self.async_db.add_meta_cost_outside_the_queue_async(
+                program.id, meta_cost, update_id, META_FINAL_COST_WRITE_TIMEOUT
+            )
+        else:
+            stored = await self.async_db.add_meta_cost_async(
+                program.id, meta_cost, update_id
+            )
         if stored is None:
             raise ValueError(f"The database does not hold program {program.id}")
         # Keep the program in memory in step with the database. A write of
@@ -734,6 +750,51 @@ class ShinkaEvolveRunner:
             program.metadata = {}
         program.metadata.update(stored)
         logger.info(f"Stored meta cost ${meta_cost:.4f} in program {program.id}")
+
+    async def _store_final_meta_cost(
+        self, program: Program, meta_cost: float, update_id: str
+    ) -> None:
+        """Write the cost of the final summary, as _store_meta_cost() does.
+
+        Keep the program and the update id of the write: at the end of the
+        launch, a write that did not start goes outside the write queue.
+        """
+        self.final_meta_cost_write = (program, update_id)
+        await self._store_meta_cost(program, meta_cost, update_id)
+
+    async def _store_final_meta_cost_outside_the_queue(self) -> None:
+        """Write the cost of the final summary outside the write queue.
+
+        The end of the launch calls it after the wait for the cost writes,
+        for a cost write of the final summary that did not start. An earlier
+        cost write can then hold each worker of the write queue, while the
+        database accepts other writes. As the final write of main, this write
+        gets 1 try, and a failure goes to the log. When it commits, a save of
+        the meta state holds the update.
+        """
+        if self.final_meta_cost_write is None:
+            return
+        program, update_id = self.final_meta_cost_write
+        update = next(
+            (
+                u
+                for u in self.meta_summarizer.unsaved_updates
+                if u.update_id == update_id
+            ),
+            None,
+        )
+        if update is None or not self.async_db.meta_cost_write_waits_in_queue(
+            update_id
+        ):
+            return
+        try:
+            await self._store_meta_cost(
+                program, update.cost, update_id, outside_the_queue=True
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store final meta cost in database: {e!r}")
+            return
+        update.cost_stored = True
 
     def _keep_live_meta_cost(self, program: Program, update: MetaUpdate) -> None:
         """Keep the cost of the meta update that a program started.
@@ -1370,7 +1431,7 @@ class ShinkaEvolveRunner:
                                 self.meta_summarizer.perform_final_summary_async(
                                     str(self.results_dir),
                                     best_program,
-                                    partial(self._store_meta_cost, best_program),
+                                    partial(self._store_final_meta_cost, best_program),
                                 ),
                                 timeout=META_SUMMARY_TIMEOUT,
                             )
@@ -1404,6 +1465,7 @@ class ShinkaEvolveRunner:
             # Save final meta state, after the cost writes of the meta updates
             if self.meta_summarizer:
                 await self.meta_summarizer.wait_for_cost_writes(META_SUMMARY_TIMEOUT)
+                await self._store_final_meta_cost_outside_the_queue()
             self._save_meta_state()
 
             # Save final bandit state

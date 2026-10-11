@@ -1753,6 +1753,209 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     assert (stored[copy_key] > 0) == (failure != "fails 3 times")
 
 
+class HardStop(BaseException):
+    """A stop of the process with no cleanup, as a kill gives."""
+
+
+def hold_the_queue_worker_after_the_jobs(
+    patch, separate_write: str = "commits", hard_stop: bool = False
+) -> dict[str, list[str]]:
+    """Make the cost write of the first meta update hold the 1 worker of the queue.
+
+    That write waits before the write queue until the jobs end. Then its
+    worker thread hangs until the final W&B table, past the time limit of the
+    wait for the cost writes at the end of the launch, and the write commits.
+    The final summary starts when that write holds the worker, thus the cost
+    write of the final summary waits in the queue. The database accepts the
+    other writes meanwhile: a cost write in an other thread commits, fails, or
+    passes its time limit (separate_write).
+
+    With hard_stop, the process stops after the final table, as a kill does:
+    the held write and the queued writes do not commit, and no cleanup comes.
+
+    Returns the update id of each cost write in the worker of the queue and in
+    an other thread.
+    """
+    jobs_ended, worker_held, table_logged, killed = (
+        threading.Event() for _ in range(4)
+    )
+    writes: dict[str, list[str]] = {"queue": [], "other thread": []}
+    worker: list[threading.Thread] = []
+    add_meta_cost = ProgramDatabase.add_meta_cost
+    add_meta_cost_async = AsyncProgramDatabase.add_meta_cost_async
+    summarize = AsyncMetaSummarizer.perform_final_summary_async
+    log_final = ShinkaWandbLogger.log_final
+
+    async def wait_for_the_jobs_then_queue(self, *args):
+        assert await wait_before_the_write_queue(jobs_ended)
+        return await add_meta_cost_async(self, *args)
+
+    def hold_then_write(db, program_id, meta_cost, update_id):
+        if not worker:
+            worker.append(threading.current_thread())
+            writes["queue"].append(update_id)
+            worker_held.set()
+            assert (killed if hard_stop else table_logged).wait(timeout=30)
+            if hard_stop:
+                raise sqlite3.OperationalError("the process stopped")
+        elif threading.current_thread() is worker[0]:
+            writes["queue"].append(update_id)
+        else:
+            writes["other thread"].append(update_id)
+            if separate_write == "fails":
+                raise sqlite3.OperationalError("database is locked")
+            if separate_write == "passes its time limit":
+                assert table_logged.wait(timeout=30)
+        return add_meta_cost(db, program_id, meta_cost, update_id)
+
+    async def start_when_the_worker_is_held(self, *args, **kwargs):
+        jobs_ended.set()
+        assert await wait_before_the_write_queue(worker_held)
+        return await summarize(self, *args, **kwargs)
+
+    def log_then_release(self, **kwargs):
+        log_final(self, **kwargs)
+        table_logged.set()
+
+    async def stop_the_process(self):
+        # The queued writes do not run, and the held write does not commit
+        self.write_executor.shutdown(wait=False, cancel_futures=True)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        killed.set()
+        raise HardStop
+
+    patch.setattr(async_runner, "META_SUMMARY_TIMEOUT", 1.0)
+    patch.setattr(
+        AsyncProgramDatabase, "add_meta_cost_async", wait_for_the_jobs_then_queue
+    )
+    patch.setattr(ProgramDatabase, "add_meta_cost", hold_then_write)
+    patch.setattr(
+        AsyncMetaSummarizer,
+        "perform_final_summary_async",
+        start_when_the_worker_is_held,
+    )
+    patch.setattr(ShinkaWandbLogger, "log_final", log_then_release)
+    if hard_stop:
+        patch.setattr(AsyncProgramDatabase, "close_async", stop_the_process)
+    return writes
+
+
+def final_readers_with_one_worker(run_dir, monkeypatch, name, model=None) -> dict:
+    """Run one launch with 1 worker in the write queue, and a model of its writes.
+
+    The update of job 1 writes its cost to program 1, the best program. Job 2
+    waits for the final summary, which writes its cost to the same program.
+    Return the meta cost of each program in the final W&B table, the totals of
+    the final console summary, the programs of each meta update, what the
+    model returns, and whether the launch stopped.
+    """
+    meta_llm = StubMetaLLM(name)
+    stopped = False
+    with monkeypatch.context() as patch:
+        run = record_wandb(patch)
+        texts = record_final_console_summaries(patch)
+        model_result = model(patch) if model else None
+        try:
+            launch_with_no_wait(
+                run_dir, meta_llm, [1, 2], 2, scores={1: 2.0}, max_db_workers=1
+            )
+        except HardStop:
+            stopped = True
+    return {
+        "table": final_table_meta_costs(run, run_dir),
+        "console": console_costs(texts[-1]) if texts else None,
+        "updates": meta_llm.batches,
+        "model": model_result,
+        "stopped": stopped,
+    }
+
+
+@pytest.mark.parametrize("hard_stop", [False, True], ids=["ends", "hard stop"])
+def test_final_cost_write_behind_a_held_queue_worker_is_as_on_main(
+    tmp_path, monkeypatch, hard_stop
+):
+    run_dir = tmp_path / "run"
+    reference = final_readers_with_one_worker(
+        tmp_path / "reference", monkeypatch, "launch 1"
+    )
+    saves = check_each_save(monkeypatch, run_dir)
+
+    result = final_readers_with_one_worker(
+        run_dir,
+        monkeypatch,
+        "launch 1",
+        partial(hold_the_queue_worker_after_the_jobs, hard_stop=hard_stop),
+    )
+
+    # main writes the cost of its final summary in a free thread. Here, after
+    # the wait for the cost writes, that write goes outside the write queue
+    # one time. Thus the final table and the console summary are as on main.
+    assert result["stopped"] == hard_stop
+    assert result["table"] == reference["table"]
+    writes = result["model"]
+    assert len(writes["other thread"]) == 1
+    assert writes["other thread"][0] != writes["queue"][0]
+    if hard_stop:
+        # The cost write of the first update did not commit before the stop
+        final_cost = round(update_costs(result["updates"][1:]), 6)
+        assert stored_meta_costs_by_generation(run_dir) == {0: 0, 1: final_cost, 2: 0}
+    else:
+        assert result["console"] == reference["console"]
+        # The queued write of the final summary runs after the held write. It
+        # has the same update id, thus the database holds each cost 1 time.
+        assert len(writes["queue"]) == 2
+        paid = round(update_costs(result["updates"]), 6)
+        assert stored_meta_costs_by_generation(run_dir) == {0: 0, 1: paid, 2: 0}
+    assert saves and not any(saves)
+
+    # A resume pays the final summary 1 time. After the hard stop, it makes
+    # the first update again, because the database does not hold its cost.
+    resume_llm = StubMetaLLM("launch 2")
+    launch(run_dir, resume_llm, [], meta_rec_interval=2, max_db_workers=1)
+    assert resume_llm.batches == ([[0, 1]] if hard_stop else [])
+    assert waiting_generations(read_state(run_dir)) == []
+
+
+@pytest.mark.parametrize("separate_write", ["fails", "passes its time limit"])
+def test_failed_final_cost_write_outside_the_queue_goes_to_the_log(
+    tmp_path, monkeypatch, caplog, separate_write
+):
+    run_dir = tmp_path / "run"
+    reference = final_readers_with_one_worker(
+        tmp_path / "reference", monkeypatch, "launch 1"
+    )
+    saves = check_each_save(monkeypatch, run_dir)
+    monkeypatch.setattr(async_runner, "META_FINAL_COST_WRITE_TIMEOUT", 0.5)
+
+    result = final_readers_with_one_worker(
+        run_dir,
+        monkeypatch,
+        "launch 1",
+        partial(hold_the_queue_worker_after_the_jobs, separate_write=separate_write),
+    )
+
+    # As the final write of main, the write outside the queue has 1 try with
+    # a time limit, and a failure goes to the log. Thus the final table does
+    # not show that cost, as on main when its write fails.
+    assert len(result["model"]["other thread"]) == 1
+    assert "Failed to store final meta cost in database" in caplog.text
+    assert ("TimeoutError" in caplog.text) == (separate_write != "fails")
+    final_cost = round(update_costs(result["updates"][1:]), 6)
+    assert result["table"] == {
+        **reference["table"],
+        1: round(reference["table"][1] - final_cost, 6),
+    }
+    # The queued write commits after the held write, at the end of the launch.
+    # Then the database holds each cost 1 time, and the state file holds the
+    # update: a resume does not pay the final summary again.
+    paid = round(update_costs(result["updates"]), 6)
+    assert stored_meta_costs_by_generation(run_dir) == {0: 0, 1: paid, 2: 0}
+    assert saves and not any(saves)
+    resume_llm = StubMetaLLM("launch 2")
+    launch(run_dir, resume_llm, [], meta_rec_interval=2, max_db_workers=1)
+    assert resume_llm.batches == []
+
+
 def make_meta_program(generation: int) -> Program:
     """Give a correct program of a generation, for a meta update."""
     program = make_program(f"gen-{generation}", generation, score=1.0)
@@ -1799,6 +2002,33 @@ def test_update_takes_its_result_while_its_cost_write_waits():
 
     assert recommendations == "1. Recommendation of launch 1 update 1."
     assert meta_cost == pytest.approx(0.04)
+
+
+def test_cost_write_outside_the_queue_keeps_the_update_after_a_failed_try(tmp_path):
+    summarizer = make_summarizer(StubMetaLLM("launch 1"), tmp_path / STATE_FILE)
+    may_fail = asyncio.Event()
+
+    async def store_cost(meta_cost, update_id):
+        await may_fail.wait()
+        raise sqlite3.OperationalError("database is locked")
+
+    async def update():
+        await summarizer.update_meta_memory_async(None, store_cost)
+        # The end of a launch writes the cost outside the write queue, while
+        # the queued write waits
+        (meta_update,) = summarizer.unsaved_updates
+        meta_update.cost_stored = True
+        may_fail.set()
+        await summarizer.wait_for_cost_writes()
+
+    asyncio.run(update())
+
+    # Each try of the queued write then fails. The database holds the cost,
+    # thus the saved state holds the update.
+    assert summarizer.unsaved_updates == []
+    assert read_state(tmp_path)["meta_recommendations_history"] == [
+        "1. Recommendation of launch 1 update 1."
+    ]
 
 
 def test_two_updates_can_wait_for_their_cost_at_the_same_time(tmp_path):

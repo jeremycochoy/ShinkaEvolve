@@ -249,11 +249,13 @@ class AsyncMetaSummarizer:
         saved state takes the updates in their order. When each try fails, no
         save holds the update, and a later launch makes the update again.
         """
-        update.cost_stored = (
+        stored = (
             store_cost is None
             or update.cost <= 0
             or await self._try_cost_write(update, store_cost)
         )
+        # The end of a launch can write the cost outside the write queue
+        update.cost_stored = update.cost_stored or stored
         if previous is not None and not previous.done():
             # A save holds an update exactly when the database holds its
             # cost, also while the update waits: a stop then does not lose it

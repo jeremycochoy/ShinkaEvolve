@@ -10,7 +10,7 @@ import time
 import threading
 import traceback
 from typing import List, Optional, Tuple, Dict, Any
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from .complexity import analyze_code_metrics
 from .dbase import Program, ProgramDatabase
@@ -98,6 +98,9 @@ class AsyncProgramDatabase:
             max_workers = 1
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.write_executor = ThreadPoolExecutor(max_workers=max_workers)
+        # The write in the write queue of each meta cost write in progress, by
+        # update id
+        self.meta_cost_writes: Dict[str, Future] = {}
         self._lock = asyncio.Lock()
         self._source_job_id_lock = threading.Lock()
         # The (job id, generation) of each insert in flight
@@ -723,6 +726,21 @@ class AsyncProgramDatabase:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.write_executor, update_metadata_sync)
 
+    def _add_meta_cost_sync(
+        self, program_id: str, meta_cost: float, update_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update with a database of the worker thread."""
+        thread_db = None
+        try:
+            thread_db = ProgramDatabase(
+                self.sync_db.config,
+                embedding_model=self.sync_db.embedding_model,
+            )
+            return thread_db.add_meta_cost(program_id, meta_cost, update_id)
+        finally:
+            if thread_db is not None:
+                thread_db.close()
+
     async def add_meta_cost_async(
         self, program_id: str, meta_cost: float, update_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -733,21 +751,43 @@ class AsyncProgramDatabase:
         adds the cost of an update one time. Returns the meta cost fields of
         the program, or None when the database does not hold the program.
         """
+        write = self.write_executor.submit(
+            self._add_meta_cost_sync, program_id, meta_cost, update_id
+        )
+        self.meta_cost_writes[update_id] = write
+        try:
+            return await asyncio.wrap_future(write)
+        finally:
+            self.meta_cost_writes.pop(update_id, None)
 
-        def add_meta_cost_sync() -> Optional[Dict[str, Any]]:
-            thread_db = None
-            try:
-                thread_db = ProgramDatabase(
-                    self.sync_db.config,
-                    embedding_model=self.sync_db.embedding_model,
-                )
-                return thread_db.add_meta_cost(program_id, meta_cost, update_id)
-            finally:
-                if thread_db is not None:
-                    thread_db.close()
+    def meta_cost_write_waits_in_queue(self, update_id: str) -> bool:
+        """Check if the cost write of a meta update waits in the write queue.
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.write_executor, add_meta_cost_sync)
+        True when no worker of the queue took the write.
+        """
+        write = self.meta_cost_writes.get(update_id)
+        return write is not None and not write.running() and not write.done()
+
+    async def add_meta_cost_outside_the_queue_async(
+        self, program_id: str, meta_cost: float, update_id: str, timeout: float
+    ) -> Optional[Dict[str, Any]]:
+        """Add the cost of a meta update in a separate worker, with 1 try.
+
+        The end of a launch uses it for a cost write that waits in the write
+        queue: an earlier write can hold each worker of the queue, while the
+        database accepts other writes. The add and the update id are the same,
+        thus the queued write adds nothing when it runs later. Raises
+        asyncio.TimeoutError after timeout seconds.
+        """
+        worker = ThreadPoolExecutor(max_workers=1)
+        try:
+            write = worker.submit(
+                self._add_meta_cost_sync, program_id, meta_cost, update_id
+            )
+            return await asyncio.wait_for(asyncio.wrap_future(write), timeout)
+        finally:
+            # A write that passes the time limit continues in its thread
+            worker.shutdown(wait=False)
 
     def _schedule_embedding_recomputation(self):
         """Schedule embedding recomputation as a background task."""
