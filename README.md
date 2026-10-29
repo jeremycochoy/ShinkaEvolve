@@ -13,6 +13,11 @@
   <a href="https://colab.research.google.com/github/SakanaAI/ShinkaEvolve/blob/main/examples/shinka_tutorial.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" /></a>
 </p>
 
+## Package Age Rule
+
+Do not install a PyPI or npm package version that is less than 7 days old. A new release can contain malware.
+Use this limit for each installation: `--uploaded-prior-to=P7D` with pip 26.1 or later, `exclude-newer = "7 days"` with uv, and `min-release-age=7` with npm 11.10 or later.
+
 
 [`shinka`](https://sakana.ai/shinka-evolve/) is a framework that combines Large Language Models (LLMs) with evolutionary algorithms to drive scientific discovery. By leveraging the creative capabilities of LLMs and the optimization power of evolutionary search, `shinka` enables automated exploration and improvement of scientific code. The system is inspired by the [AI Scientist](https://sakana.ai/ai-scientist/), [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) and the [Darwin Goedel Machine](https://sakana.ai/dgm/): It maintains a population of programs that evolve over generations, with an ensemble of LLMs acting as intelligent mutation operators that suggest code improvements.
 
@@ -503,7 +508,7 @@ Precedence: config YAML < `--set` < authoritative flags.
 
 ### Headless Agent Models
 
-Use `headless/<agent>` model strings to route mutation calls through the local Headless CLI instead of provider API clients. Shinka uses `npx -y @roberttlange/headless` by default and runs `headless --check` before evolution starts.
+Use `headless/<agent>` model strings to route mutation calls through the local Headless CLI instead of provider API clients. Shinka uses `npx -y --min-release-age=7 @roberttlange/headless` by default and runs `headless --check` before evolution starts.
 
 ```bash
 shinka_run \
