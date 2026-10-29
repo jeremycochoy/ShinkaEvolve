@@ -19,7 +19,7 @@ from shinka.llm.constants import TIMEOUT
 
 from .result import QueryResult
 
-DEFAULT_HEADLESS_COMMAND = "npx -y @roberttlange/headless"
+DEFAULT_HEADLESS_COMMAND = "npx -y --min-release-age=7 @roberttlange/headless"
 HEADLESS_COMMAND_ENV = "SHINKA_HEADLESS_COMMAND"
 HEADLESS_TIMEOUT_ENV = "SHINKA_HEADLESS_TIMEOUT"
 

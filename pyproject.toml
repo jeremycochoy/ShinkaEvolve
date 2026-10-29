@@ -106,3 +106,7 @@ markers = [
     "models_dev_live: live models.dev catalog contract coverage",
     "requires_secrets: tests that need CI secrets or private credentials",
 ]
+
+[tool.uv]
+# Package age rule (README.md): resolve no package version that is less than 7 days old.
+exclude-newer = "7 days"
