@@ -243,6 +243,39 @@ def test_query_claude_cli_forwards_model_effort_and_hardening_flags(tmp_path, mo
     assert "--dangerously-skip-permissions" not in argv
 
 
+def test_query_claude_cli_disables_auto_memory_and_strips_keys(tmp_path, monkeypatch):
+    """The subprocess gets no auto-memory of the CWD and no inherited key."""
+    script = tmp_path / "fake_claude_env.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import json, os, sys",
+                "sys.stdin.read()",
+                "names = ['CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'ANTHROPIC_API_KEY',",
+                "         'CLAUDE_CODE_OAUTH_TOKEN']",
+                "env = {name: os.environ.get(name) for name in names}",
+                "print(json.dumps({'is_error': False, 'result': json.dumps(env),",
+                "                  'total_cost_usd': 0, 'usage': {'output_tokens': 1}}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_COMMAND", _fake_claude_command(script))
+    monkeypatch.setenv("SHINKA_CLAUDE_CLI_TIMEOUT", "10")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "inherited")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "inherited")
+
+    result = query_claude_cli(
+        None, "claude-cli/claude-opus-5-5", "hello", "system", [], output_model=None
+    )
+
+    assert json.loads(result.content) == {
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "ANTHROPIC_API_KEY": None,
+        "CLAUDE_CODE_OAUTH_TOKEN": None,
+    }
+
+
 def test_query_claude_cli_passes_empty_system_prompt_when_caller_gives_none(
     tmp_path, monkeypatch
 ):
