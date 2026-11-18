@@ -240,6 +240,10 @@ def test_query_claude_cli_forwards_model_effort_and_hardening_flags(tmp_path, mo
     # checks left ON (nothing to bypass since --tools "" leaves no tools).
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--setting-sources") + 1] == ""
+    # No MCP server: no --mcp-config, and --strict-mcp-config skips the
+    # claude.ai connectors of the account.
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
 

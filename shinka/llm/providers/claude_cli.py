@@ -21,6 +21,10 @@ Isolation contract — each subprocess is a pure text completion:
     - ``--setting-sources ""`` skips user/project/local settings so ambient
       ``CLAUDE.md`` and ``.claude/settings.json`` (including hooks) in the
       caller's CWD cannot influence or execute around each query.
+    - ``--strict-mcp-config`` with no ``--mcp-config``: no MCP server. Without
+      it, a query can get the claude.ai connectors of the account (for example
+      Gmail, Google Drive and Claude Docs): about 30 tools and their
+      instructions. ``--tools ""`` disables the built-in tools only.
     - ``--system-prompt`` is passed unconditionally, so the caller's system
       message always fully replaces the default Claude Code agent persona
       (an empty string is a valid replacement).
@@ -193,6 +197,7 @@ def _build_command(model: ClaudeCliModel, system_msg: str) -> list[str]:
         "",
         "--setting-sources",
         "",
+        "--strict-mcp-config",
         "--system-prompt",
         system_msg,
     ]
