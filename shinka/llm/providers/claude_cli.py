@@ -24,6 +24,10 @@ Isolation contract — each subprocess is a pure text completion:
     - ``--system-prompt`` is passed unconditionally, so the caller's system
       message always fully replaces the default Claude Code agent persona
       (an empty string is a valid replacement).
+    - ``CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`` in the subprocess environment: the
+      auto-memory index of the caller's CWD is not added to each query.
+      ``--setting-sources ""`` does not stop it: from a CWD with a memory
+      index, each query got about 7,000 more input tokens.
     - ``--dangerously-skip-permissions`` is intentionally NOT set — with zero
       tools there is nothing to bypass, and skipping permissions here would
       re-open the sandbox against prompt-injection from evolved programs.
@@ -203,6 +207,7 @@ def _subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     return env
 
 
