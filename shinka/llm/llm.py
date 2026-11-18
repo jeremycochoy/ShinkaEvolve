@@ -950,14 +950,15 @@ def extract_between(
     # The tags are literal text, not patterns: a fence such as ```c++ must not
     # compile to a possessive quantifier that matches "c" and leaves "++" in
     # the extracted code.
-    end_pattern = re.escape(end)
-    if start.startswith("<"):
-        # An XML tag with no end tag (small models, DeepSeek) ends at the next
-        # tag. Code in a fence keeps its "<cstdio>" or "Vec<Order>" text.
-        end_pattern = f"(?:{end_pattern}|(?=\\s*<[A-Za-z]+>))"
     match = re.search(
-        f"{re.escape(start)}\\s*(.*?)\\s*{end_pattern}", content, re.DOTALL
+        f"{re.escape(start)}\\s*(.*?)\\s*{re.escape(end)}", content, re.DOTALL
     )
+    if match is None and start.startswith("<"):
+        # An XML tag with no end tag (small models, DeepSeek) ends at the next
+        # tag. With its end tag, the text keeps its "Vec<Order>" text.
+        match = re.search(
+            f"{re.escape(start)}\\s*(.*?)(?=\\s*<[A-Za-z]+>)", content, re.DOTALL
+        )
     if match:
         matched_str = match.group(1).strip()
         if return_dict:

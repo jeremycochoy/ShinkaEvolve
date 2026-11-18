@@ -747,19 +747,6 @@ class ShinkaEvolveRunner:
         except Exception as e:
             logger.warning(f"Failed to restore meta state: {e}")
 
-    def _get_meta_costs(self) -> float:
-        """Get the cost of the meta updates that the database holds.
-
-        The sum is on the evaluated programs only: an island copy can repeat
-        the cost of its program.
-        """
-        if self.meta_summarizer is None:
-            return 0.0
-        return sum(
-            (program.metadata or {}).get("meta_cost") or 0.0
-            for program in self.db.get_evaluated_programs()
-        )
-
     async def _store_meta_cost(
         self,
         program: Program,
@@ -855,7 +842,7 @@ class ShinkaEvolveRunner:
         )
 
     async def _charge_failed_meta_update(
-        self, program: Program, meta_cost: float
+        self, program: Program, meta_cost: float, outside_the_queue: bool = False
     ) -> None:
         """Charge the cost of a meta update that failed after billed queries.
 
@@ -863,6 +850,8 @@ class ShinkaEvolveRunner:
         the live costs of the program take the cost, and a write adds it to
         the program in the database, one time, with an id of its own. The id
         starts with "failed-", thus no save of the meta state waits for it.
+        At the end of a launch (outside_the_queue), the write does not wait
+        for the write queue, as the final write of an update.
         """
         if meta_cost <= 0:
             return
@@ -870,7 +859,9 @@ class ShinkaEvolveRunner:
         self.total_api_cost += meta_cost
         self.live_meta_costs.setdefault(program.id, {})[update_id] = meta_cost
         try:
-            await self._store_meta_cost(program, meta_cost, update_id)
+            await self._store_meta_cost(
+                program, meta_cost, update_id, outside_the_queue=outside_the_queue
+            )
         except Exception as e:
             logger.warning(f"Failed to store the cost of a failed meta update: {e!r}")
 
@@ -1486,7 +1477,9 @@ class ShinkaEvolveRunner:
                                 self.total_api_cost += final_meta_cost
                             elif not success:
                                 await self._charge_failed_meta_update(
-                                    best_program, final_meta_cost
+                                    best_program,
+                                    final_meta_cost,
+                                    outside_the_queue=True,
                                 )
                             if self.verbose:
                                 if success and final_meta_cost > 0:

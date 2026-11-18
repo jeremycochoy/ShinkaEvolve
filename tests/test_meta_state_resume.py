@@ -586,8 +586,8 @@ def test_launch_on_generation_0_only_loads_the_costs_of_the_database(
     async def paid_embedding(self, exec_fname):
         return None, 0.5
 
-    # The embedding of each program costs 0.5. The island copy of the first
-    # program of generation 0 holds a copy of that cost.
+    # The embedding of each program costs 0.5. As on main, the island copy of
+    # the first program of generation 0 holds no cost.
     monkeypatch.setattr(ShinkaEvolveRunner, "_get_code_embedding_async", paid_embedding)
     first = launch(run_dir, StubMetaLLM("launch 1"), [], meta_rec_interval=1)
     second = launch(run_dir, StubMetaLLM("launch 2"), [], meta_rec_interval=1)
@@ -1911,16 +1911,19 @@ def hold_the_queue_worker_after_the_jobs(
     return writes
 
 
-def final_readers_with_one_worker(run_dir, monkeypatch, name, model=None) -> dict:
+def final_readers_with_one_worker(
+    run_dir, monkeypatch, name, model=None, failing_updates=()
+) -> dict:
     """Run one launch with 1 worker in the write queue, and a model of its writes.
 
     The update of job 1 writes its cost to program 1, the best program. Job 2
     waits for the final summary, which writes its cost to the same program.
     Return the meta cost of each program in the final W&B table, the totals of
     the final console summary, the programs of each meta update, what the
-    model returns, and whether the launch stopped.
+    model returns, and whether the launch stopped. The updates of
+    failing_updates give no recommendations.
     """
-    meta_llm = StubMetaLLM(name)
+    meta_llm = StubMetaLLM(name, failing_updates=failing_updates)
     stopped = False
     with monkeypatch.context() as patch:
         run = record_wandb(patch)
@@ -1939,6 +1942,27 @@ def final_readers_with_one_worker(run_dir, monkeypatch, name, model=None) -> dic
         "model": model_result,
         "stopped": stopped,
     }
+
+
+def test_charge_of_a_failed_final_summary_does_not_wait_for_a_held_queue_worker(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+
+    result = final_readers_with_one_worker(
+        run_dir,
+        monkeypatch,
+        "launch 1",
+        hold_the_queue_worker_after_the_jobs,
+        failing_updates={2},
+    )
+
+    # The final summary fails. Its charge goes outside the write queue, as the
+    # final write of an update, thus the launch does not wait for the held
+    # worker. The database holds the cost of the 2 updates.
+    writes = result["model"]
+    assert [update_id[:7] for update_id in writes["other thread"]] == ["failed-"]
+    assert stored_meta_costs(run_dir) == pytest.approx(update_costs(result["updates"]))
 
 
 @pytest.mark.parametrize("hard_stop", [False, True], ids=["ends", "hard stop"])
@@ -3642,33 +3666,6 @@ def test_get_evaluated_programs_orders_by_generation_and_skips_copies(tmp_path):
     evaluated = db.get_evaluated_programs()
 
     assert [program.id for program in evaluated] == ["gen-0", "gen-1", "gen-2", "gen-3"]
-    db.close()
-
-
-def test_meta_costs_of_the_database_skip_the_island_copies(tmp_path):
-    config = DatabaseConfig(
-        db_path=str(tmp_path / "programs.sqlite"),
-        num_islands=2,
-        enable_dynamic_islands=True,
-        stagnation_threshold=2,
-    )
-    db = ProgramDatabase(config=config, embedding_model="")
-    initial_program = make_program("gen-0", generation=0, score=1.0)
-    initial_program.metadata = {"meta_cost": 0.03}
-    db.add(initial_program)
-    # No generation is better than generation 0, thus the database makes a new
-    # island from a copy of the initial program.
-    for generation in (1, 2, 3):
-        db.add(make_program(f"gen-{generation}", generation, score=0.5))
-    # As on main, each copy of the initial program holds no meta cost.
-    stored = [program.metadata.get("meta_cost") for program in db.get_all_programs()]
-    assert len(stored) > 4
-    assert sum(cost or 0.0 for cost in stored) == pytest.approx(0.03)
-
-    runner = make_runner(tmp_path / "run", StubMetaLLM("launch 1"), meta_rec_interval=1)
-    runner.db = db
-
-    assert runner._get_meta_costs() == pytest.approx(0.03)
     db.close()
 
 

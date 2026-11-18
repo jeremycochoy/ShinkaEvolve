@@ -14,6 +14,13 @@ def test_tag_with_no_end_tag_ends_at_the_next_tag():
     )
 
 
+def test_tag_with_its_end_tag_keeps_its_angle_bracket_text():
+    content = "<DESCRIPTION>Use Vec<Order> here.</DESCRIPTION>"
+    assert extract_between(content, "<DESCRIPTION>", "</DESCRIPTION>", False) == (
+        "Use Vec<Order> here."
+    )
+
+
 @pytest.mark.parametrize(
     ("fence", "code"),
     [

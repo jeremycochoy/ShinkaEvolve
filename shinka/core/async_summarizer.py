@@ -329,7 +329,12 @@ class AsyncMetaSummarizer:
     async def _step1_individual_summaries_async(
         self, programs_to_analyze: List[Program]
     ) -> Tuple[Optional[str], float]:
-        """Async version of Step 1: Create individual summaries for each program using batch queries."""
+        """Async version of Step 1: Create individual summaries for each program using batch queries.
+
+        The interface of SakanaAI main. A meta update calls
+        _summarize_programs_async(), which also gives the programs with a
+        summary.
+        """
         _, summary, cost = await self._summarize_programs_async(programs_to_analyze)
         return summary, cost
 

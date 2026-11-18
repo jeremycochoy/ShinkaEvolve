@@ -28,11 +28,15 @@ All notable changes to `shinka-evolve` are documented in this file.
   its cost to a waiting program. With no generation left or the cost budget
   used, that update runs whatever the interval, because the final summary
   needs a correct program.
-- Fixed step 1 of the async meta update to make one query for each program, so
-  each summary keeps the identifier of its program. Before, a failed answer
-  gave the later summaries the identifier of another program, and its program
-  got no summary. A program with a missing or blank answer now waits for the
-  next update.
+- Fixed step 1 of the async meta update so that a program with a missing or
+  blank answer waits for the next update. Before, its program counted as
+  summarized. Step 1 uses the indexed batch query of SakanaAI main, thus each
+  summary keeps the identifier of its program.
+- Fixed `extract_between()` so that a fenced code block keeps its `<word>`
+  text, for example `#include <cstdio>`. The rule for an XML tag with no end
+  tag (it ends at the next tag) now applies only when the end tag is missing.
+- Fixed the async runner so that a failed meta update charges its cost to the
+  live total and to the database, with an id of its own.
 - Fixed the async runner so a new job with the identifier of a stored job gets
   its own row. The identifier of a local job holds the PID of its process, and
   the system can give that PID to a new process, for example after a resume.
