@@ -955,9 +955,10 @@ def extract_between(
     )
     if match is None and start.startswith("<"):
         # An XML tag with no end tag (small models, DeepSeek) ends at the next
-        # tag. With its end tag, the text keeps its "Vec<Order>" text.
+        # tag, also a wrong end tag. With its end tag, the text keeps its
+        # "Vec<Order>" text.
         match = re.search(
-            f"{re.escape(start)}\\s*(.*?)(?=\\s*<[A-Za-z]+>)", content, re.DOTALL
+            f"{re.escape(start)}\\s*(.*?)(?=\\s*</?[A-Za-z]+>)", content, re.DOTALL
         )
     if match:
         matched_str = match.group(1).strip()

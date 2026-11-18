@@ -34,7 +34,8 @@ All notable changes to `shinka-evolve` are documented in this file.
   summary keeps the identifier of its program.
 - Fixed `extract_between()` so that a fenced code block keeps its `<word>`
   text, for example `#include <cstdio>`. The rule for an XML tag with no end
-  tag (it ends at the next tag) now applies only when the end tag is missing.
+  tag now applies only when the end tag is missing, and the text then ends at
+  the next tag, also at a wrong end tag such as `</DESCRIPTION>`.
 - Fixed the async runner so that a failed meta update charges its cost to the
   live total and to the database, with an id of its own.
 - Fixed the async runner so a new job with the identifier of a stored job gets

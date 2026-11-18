@@ -14,6 +14,12 @@ def test_tag_with_no_end_tag_ends_at_the_next_tag():
     )
 
 
+def test_tag_with_a_wrong_end_tag_ends_at_that_tag():
+    # A real DeepSeek answer: "</DESCRIPTION>" in place of "</NAME>"
+    content = "<NAME>\ngru_mup_tuned\n\n</DESCRIPTION>\nThe current config uses lr=5e-4."
+    assert extract_between(content, "<NAME>", "</NAME>", False) == "gru_mup_tuned"
+
+
 def test_tag_with_its_end_tag_keeps_its_angle_bracket_text():
     content = "<DESCRIPTION>Use Vec<Order> here.</DESCRIPTION>"
     assert extract_between(content, "<DESCRIPTION>", "</DESCRIPTION>", False) == (
