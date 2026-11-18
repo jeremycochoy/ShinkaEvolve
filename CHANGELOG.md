@@ -4,6 +4,20 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ## Unreleased (fork jeremycochoy/ShinkaEvolve)
 
+### Changed
+
+- For a `json` or `json5` task, the async runner rejects a proposal only when
+  its config is a copy. A copy has the config of a program of the database, or
+  of a proposal in flight. The check compares each float as its float32 value.
+  This copy check replaces the novelty check: the embedding threshold and the
+  novelty LLM do not apply to a JSON task. Before, the novelty check ran only
+  with `novelty_llm_models` set, and its embedding threshold also rejected
+  configs with changed values (jeremycochoy/evolve_trading#192).
+- For a `json` or `json5` task, the proposal prompt gives each earlier config
+  as its changed keys against the config to edit. This applies to the
+  evaluation history, the fix prompt and the crossover part. A code task does
+  not change.
+
 ### Fixed
 
 - Fixed the async runner so the meta summary continues across a resume. The

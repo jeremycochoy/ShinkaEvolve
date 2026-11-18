@@ -1,5 +1,6 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from shinka.database import Program
+from shinka.utils.json_config import config_diff_lines, is_json_language
 
 
 BASE_SYSTEM_MSG = (
@@ -36,14 +37,39 @@ Here is additional text feedback about the current program:
 """
 
 
+def format_prior_program(
+    program: Program,
+    language: str,
+    parent: Optional[Program] = None,
+    parent_name: str = "current program",
+) -> str:
+    """Return the code of an earlier program for a prompt.
+
+    For a JSON task with a parent, return the changed keys of the earlier
+    config against the config of the parent. A config that does not parse
+    goes in full.
+    """
+    if parent is not None and is_json_language(language):
+        lines = config_diff_lines(program.code, parent.code, language)
+        if lines is not None:
+            changes = "\n".join(lines) if lines else "no changed keys"
+            return (
+                f"Changed keys (value in this program -> value in the "
+                f"{parent_name}):\n{changes}\n\n"
+            )
+    return f"```{language}\n{program.code}\n```\n\n"
+
+
 def construct_eval_history_msg(
     inspiration_programs: List[Program],
     language: str = "python",
     include_text_feedback: bool = False,
     correct: bool = True,
+    parent: Optional[Program] = None,
 ) -> str:
     """Construct an edit message for the given parent program and
-    inspiration programs."""
+    inspiration programs. For a JSON task, each inspiration config goes as
+    its changed keys against the config of the parent."""
     if correct:
         inspiration_str = (
             "Here are the performance metrics of a set of previously "
@@ -58,7 +84,12 @@ def construct_eval_history_msg(
     for i, prog in enumerate(inspiration_programs):
         if i == 0:
             inspiration_str += "# Prior programs\n\n"
-        inspiration_str += f"```{language}\n{prog.code}\n```\n\n"
+        inspiration_str += format_prior_program(
+            prog,
+            language,
+            parent,
+            "current program" if correct else "program to fix",
+        )
 
         if correct:
             inspiration_str += (

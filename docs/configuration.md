@@ -34,7 +34,7 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 | `max_patch_resamples` | `int` | `3` | Max patch resample loops per novelty attempt. |
 | `max_patch_attempts` | `int` | `1` | Max attempts to produce a syntactically valid patch. |
 | `job_type` | `str` | `'local'` | Job backend: `local`, `slurm_docker`, `slurm_conda`. |
-| `language` | `str` | `'python'` | Language tag for prompts + file handling. |
+| `language` | `str` | `'python'` | Language tag for prompts + file handling. For `json` and `json5`, see [JSON tasks](#json-tasks). |
 | `llm_models` | `List[str]` | `['gpt-5-mini', 'gemini-3-flash-preview', 'gemini-3.1-pro-preview', 'gpt-5.4']` | Mutation model pool. |
 | `llm_dynamic_selection` | `Optional[Union[str, BanditBase]]` | `'ucb'` | Dynamic model selection (`fixed`, `ucb`, `ucb1`, `thompson`, or bandit object). |
 | `llm_dynamic_selection_kwargs` | `dict` | `{'cost_aware_coef': 0.5}` | kwargs forwarded to selected bandit. |
@@ -59,9 +59,9 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 | `wandb_run_id` | `Optional[str]` | `None` | Optional W&B run ID; otherwise generated and persisted in the results directory. |
 | `wandb_resume` | `str` | `'allow'` | W&B resume policy used with the persisted run ID. |
 | `wandb_config` | `Dict[str, Any]` | `{}` | Extra W&B config values merged into the run config. |
-| `max_novelty_attempts` | `int` | `3` | Max novelty loops per generation. |
-| `code_embed_sim_threshold` | `float` | `0.99` | Similarity threshold used by novelty checks. |
-| `novelty_llm_models` | `Optional[List[str]]` | `None` | Optional novelty-judge model pool. |
+| `max_novelty_attempts` | `int` | `3` | Max novelty loops per generation. For a JSON task, the maximum number of copy checks for each generation. |
+| `code_embed_sim_threshold` | `float` | `0.99` | Similarity threshold used by novelty checks. No effect for a JSON task. |
+| `novelty_llm_models` | `Optional[List[str]]` | `None` | Optional novelty-judge model pool. No effect for a JSON task. |
 | `novelty_llm_kwargs` | `dict` | `{}` | kwargs for novelty-judge LLM calls. |
 | `use_text_feedback` | `bool` | `False` | Include text feedback in mutation prompts. |
 | `max_api_costs` | `Optional[float]` | `None` | API budget cap in USD; stops new submissions at cap. |
@@ -87,6 +87,29 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 
 Resuming prompt evolution reuses stored prompts, including when only the
 initial generation-zero prompt exists. Existing IDs and fitness data are retained.
+
+### JSON tasks
+
+For a task with `language: json` or `json5`, a copy check replaces the novelty
+check. The runner does not use `code_embed_sim_threshold` or
+`novelty_llm_models`, but it calculates and keeps the embeddings as before.
+
+- The check removes the `//` comment lines of a config, parses the config and
+  changes each float to its float32 value. Thus `0.001` and
+  `0.0010000000474974513` are equal. An int is not equal to a float (`1` is
+  not `1.0`), and a bool is not equal to a number.
+- The check rejects a proposal when its config is equal to the config of a
+  program of the database (all islands, correct or not). It also rejects a
+  copy of a proposal in flight. The next novelty attempt then samples a new
+  parent and new inspirations. After `max_novelty_attempts` copies, the
+  generation gets no program.
+- A resume reads the configs of the database again. It does not know the
+  configs of the jobs in flight at the stop.
+- The proposal prompt gives each earlier config as its changed keys, against
+  the config to edit: one line `path: earlier value -> value to edit` for each
+  changed value. `(absent)` shows a key that one config does not have, and a
+  list is one value. The config to edit stays in full. A config that does not
+  parse also stays in full.
 
 Billed OpenAI replies count toward `max_api_costs` even when they contain no
 usable text. A reply exhausted by `max_output_tokens` stops proposal retries;

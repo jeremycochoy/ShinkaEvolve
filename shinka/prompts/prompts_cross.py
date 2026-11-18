@@ -1,8 +1,8 @@
 import random
-from typing import List
+from typing import List, Optional
 
 from shinka.database import Program
-from .prompts_base import perf_str
+from .prompts_base import format_prior_program, perf_str
 
 
 CROSS_SYS_FORMAT = """
@@ -58,6 +58,7 @@ def get_cross_component(
     archive_inspirations: List[Program],
     top_k_inspirations: List[Program],
     language: str = "python",
+    parent: Optional[Program] = None,
 ) -> str:
     all_inspirations = archive_inspirations + top_k_inspirations
 
@@ -67,7 +68,7 @@ def get_cross_component(
     inspiration = random.choice(all_inspirations)
 
     crossover_inspiration = "# Crossover Inspiration Programs\n"
-    crossover_inspiration += f"```{language}\n{inspiration.code}\n```\n\n"
+    crossover_inspiration += format_prior_program(inspiration, language, parent)
     crossover_inspiration += f"Performance metrics: {perf_str(inspiration.combined_score, inspiration.public_metrics)}\n\n"
 
     return crossover_inspiration
