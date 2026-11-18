@@ -274,6 +274,11 @@ def _validate_evo_config_model_env_access(evo_config: EvolutionConfig) -> None:
     )
 
 
+def json_in_flight_label(generation: int) -> str:
+    """Return the key-set label of a JSON proposal in flight."""
+    return f"gen {generation} (in flight)"
+
+
 class ShinkaEvolveRunner:
     """Fully async evolution runner with concurrent proposal generation."""
 
@@ -3145,6 +3150,7 @@ class ShinkaEvolveRunner:
         code_embedding: Optional[List[float]] = None
 
         costs_transferred = False
+        job_tracked = False
         try:
             # Select LLM once per program generation (before all loops)
             model_sample_probs = None
@@ -3419,6 +3425,7 @@ class ShinkaEvolveRunner:
                     # Track job in both running list and submitted registry
                     self.running_jobs.append(running_job)
                     self.submitted_jobs[str(job_id)] = running_job
+                    job_tracked = True
 
                     # Trigger immediate job status check to catch fast-completing jobs
                     self.slot_available.set()
@@ -3501,6 +3508,10 @@ class ShinkaEvolveRunner:
                     pending_cost, "cancelled_proposal", generation
                 )
             raise
+        finally:
+            # JSON task: a proposal with no job frees its config key
+            if not job_tracked:
+                self._release_json_config_key(generation)
 
     async def _save_patch_attempt_async(
         self,
@@ -4404,7 +4415,7 @@ class ShinkaEvolveRunner:
         """
         self.json_config_keys = {}
         for program in self.db.get_all_programs():
-            key = config_key(program.code, self.evo_config.language)
+            key = config_key(program.code)
             if key is not None:
                 self.json_config_keys.setdefault(key, f"program {program.id}")
         logger.info(
@@ -4419,9 +4430,11 @@ class ShinkaEvolveRunner:
 
         For a new config, the key goes in the key set in the same step, with
         no await: of two proposals in flight with one config, one goes through.
+        A proposal that ends with no job frees its key again
+        (_release_json_config_key).
         """
         attempt_text = f"{attempt}/{self.evo_config.max_novelty_attempts}"
-        key = config_key(code, self.evo_config.language)
+        key = config_key(code)
         if key is None:
             logger.info(
                 f"JSON COPY CHECK {attempt_text}: gen {generation} not checked, "
@@ -4435,18 +4448,37 @@ class ShinkaEvolveRunner:
                 f"same config as {copy_of}"
             )
             return copy_of
-        self.json_config_keys[key] = f"gen {generation} (in flight)"
+        self.json_config_keys[key] = json_in_flight_label(generation)
         logger.info(
             f"JSON COPY CHECK {attempt_text}: accepted gen {generation}, "
             "no program has the same config"
         )
         return None
 
+    def _release_json_config_key(self, generation: int) -> None:
+        """Remove the key of a proposal that ends with no job (JSON task).
+
+        Only a key with the in-flight label of this proposal goes: the key of
+        a stored program stays.
+        """
+        if self.json_config_keys is None:
+            return
+        label = json_in_flight_label(generation)
+        claimed = [
+            key for key, owner in self.json_config_keys.items() if owner == label
+        ]
+        for key in claimed:
+            del self.json_config_keys[key]
+            logger.info(
+                f"JSON COPY CHECK: gen {generation} ends with no job, "
+                "its config is free again"
+            )
+
     def _record_json_config_key(self, program: Program) -> None:
         """Give the key of a stored program the id of the program (JSON task)."""
         if self.json_config_keys is None:
             return
-        key = config_key(program.code, self.evo_config.language)
+        key = config_key(program.code)
         if key is not None:
             self.json_config_keys[key] = f"program {program.id}"
 

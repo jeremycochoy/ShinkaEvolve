@@ -88,29 +88,6 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 Resuming prompt evolution reuses stored prompts, including when only the
 initial generation-zero prompt exists. Existing IDs and fitness data are retained.
 
-### JSON tasks
-
-For a task with `language: json` or `json5`, a copy check replaces the novelty
-check. The runner does not use `code_embed_sim_threshold` or
-`novelty_llm_models`, but it calculates and keeps the embeddings as before.
-
-- The check removes the `//` comment lines of a config, parses the config and
-  changes each float to its float32 value. Thus `0.001` and
-  `0.0010000000474974513` are equal. An int is not equal to a float (`1` is
-  not `1.0`), and a bool is not equal to a number.
-- The check rejects a proposal when its config is equal to the config of a
-  program of the database (all islands, correct or not). It also rejects a
-  copy of a proposal in flight. The next novelty attempt then samples a new
-  parent and new inspirations. After `max_novelty_attempts` copies, the
-  generation gets no program.
-- A resume reads the configs of the database again. It does not know the
-  configs of the jobs in flight at the stop.
-- The proposal prompt gives each earlier config as its changed keys, against
-  the config to edit: one line `path: earlier value -> value to edit` for each
-  changed value. `(absent)` shows a key that one config does not have, and a
-  list is one value. The config to edit stays in full. A config that does not
-  parse also stays in full.
-
 Billed OpenAI replies count toward `max_api_costs` even when they contain no
 usable text. A reply exhausted by `max_output_tokens` stops proposal retries;
 increase `llm_kwargs.max_tokens` or lower `reasoning_efforts` before retrying.
@@ -167,6 +144,31 @@ database aggregate on a dedicated serialized telemetry worker, run at most once
 every five seconds, and overlapping refresh requests are coalesced. If the
 bounded raw-candidate queue saturates, the newest candidate event is dropped
 with a rate-limited warning; population and final snapshots remain authoritative.
+
+### JSON tasks
+
+For a task with `language: json` or `json5`, a copy check replaces the novelty
+check. The runner does not use `code_embed_sim_threshold` or
+`novelty_llm_models`, but it calculates and keeps the embeddings as before.
+
+- The check parses a config as JSON5, as the task evaluator does with
+  `json5.load`. Thus a comment or a trailing comma does not change a config.
+  The check changes each float to its float32 value. Thus `0.001` and
+  `0.0010000000474974513` are equal. An int is not equal to a float (`1` is
+  not `1.0`), and a bool is not equal to a number.
+- The check rejects a proposal when its config is equal to the config of a
+  program of the database (all islands, correct or not). It also rejects a
+  copy of a proposal in flight. A proposal that ends with no job, for example
+  after an error of the job submit, frees its config. The next novelty attempt
+  then samples a new parent and new inspirations. After `max_novelty_attempts`
+  copies, the generation gets no program.
+- A resume reads the configs of the database again. It does not know the
+  configs of the jobs in flight at the stop.
+- The proposal prompt gives each earlier config as its changed keys, against
+  the config to edit: one line `path: earlier value -> value to edit` for each
+  changed value. `(absent)` shows a key that one config does not have, and a
+  list is one value. The config to edit stays in full. A config that does not
+  parse also stays in full.
 
 ### DatabaseConfig (`shinka.database.DatabaseConfig`)
 

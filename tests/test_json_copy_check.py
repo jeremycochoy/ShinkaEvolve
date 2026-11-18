@@ -1,10 +1,13 @@
 """The copy check of a json task in the async runner, with a scripted LLM."""
 
 import asyncio
+import errno
 import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from shinka.core import EvolutionConfig
 from shinka.core.async_runner import ShinkaEvolveRunner
@@ -267,10 +270,71 @@ def test_a_code_task_has_no_copy_check(tmp_path):
     assert runner.scheduler.submitted == [PYTHON_CODE]
 
 
-def test_a_stored_program_replaces_the_in_flight_label(tmp_path):
+def test_a_stored_program_replaces_the_in_flight_label_and_keeps_its_key(
+    tmp_path,
+):
     runner = _build_runner(tmp_path, ScriptedLLM([]))
     runner.json_config_keys[config_key(NEW_CONFIG)] = "gen 4 (in flight)"
     runner._record_json_config_key(
         Program(id="program-4", code=NEW_CONFIG, language="json")
     )
+    runner._release_json_config_key(4)
     assert runner.json_config_keys[config_key(NEW_CONFIG)] == "program program-4"
+
+
+def test_a_failed_submit_frees_the_key_for_a_later_proposal(tmp_path):
+    runner = _build_runner(
+        tmp_path, ScriptedLLM([NEW_CONFIG, NEW_CONFIG]), max_novelty_attempts=1
+    )
+    submit = runner.scheduler.submit_async_nonblocking
+    calls = []
+
+    async def submit_that_fails_one_time(exec_fname, results_dir):
+        calls.append(exec_fname)
+        if len(calls) == 1:
+            # subprocess.Popen can raise this error before the process starts
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+        return await submit(exec_fname, results_dir)
+
+    async def propose_two_times():
+        return await _propose(runner, 1), await _propose(runner, 2)
+
+    runner.scheduler.submit_async_nonblocking = submit_that_fails_one_time
+
+    failed_job, job = asyncio.run(propose_two_times())
+
+    assert failed_job is None
+    assert [failure["failure_stage"] for failure in runner.failures] == [
+        "evaluation_submit"
+    ]
+    assert job is not None
+    assert runner.scheduler.submitted == [NEW_CONFIG]
+    assert runner.json_config_keys[config_key(NEW_CONFIG)] == "gen 2 (in flight)"
+
+
+def test_a_proposal_cancelled_at_the_slot_wait_frees_its_key(tmp_path):
+    runner = _build_runner(tmp_path, ScriptedLLM([NEW_CONFIG]))
+
+    async def record_unattached_cost(cost, stage, generation):
+        return None
+
+    async def cancel_at_the_slot_wait():
+        waiting = asyncio.Event()
+
+        async def acquire_no_slot():
+            waiting.set()
+            await asyncio.Event().wait()
+
+        runner.evaluation_slot_pool.acquire = acquire_no_slot
+        task = asyncio.create_task(_propose(runner, generation=1))
+        await waiting.wait()
+        assert runner.json_config_keys[config_key(NEW_CONFIG)] == "gen 1 (in flight)"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    runner._record_unattached_cost = record_unattached_cost
+
+    asyncio.run(cancel_at_the_slot_wait())
+
+    assert config_key(NEW_CONFIG) not in runner.json_config_keys

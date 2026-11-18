@@ -9,6 +9,7 @@ from shinka.core.sampler import PromptSampler
 from shinka.database import Program
 from shinka.prompts import construct_eval_history_msg, get_cross_component
 from shinka.utils.json_config import (
+    canonical_config,
     config_diff_lines,
     config_key,
     is_json_language,
@@ -56,7 +57,6 @@ def test_key_order_white_space_and_comment_lines_give_the_same_key():
         "  // EVOLVE-BLOCK-END\n}"
     )
     assert config_key(text) == config_key(other)
-    assert config_key(other, "json5") == config_key(text)
 
 
 def test_an_int_and_a_float_are_different_keys():
@@ -72,7 +72,27 @@ def test_a_bool_is_not_equal_to_a_number():
     assert config_key('{"a": false}') != config_key('{"a": 0}')
 
 
-@pytest.mark.parametrize("text", ['{"a": 1,}', "not json", ""])
+@pytest.mark.parametrize(
+    "text",
+    [
+        CONFIG.replace('{"freq": "240s"},', '{"freq": "240s"}, // 4-minute bars'),
+        CONFIG.replace('"lr": 0.001', '"lr": /* was 0.003 */ 0.001'),
+        CONFIG.replace("[0.0004, 0.0002]}", "[0.0004, 0.0002,]},"),
+    ],
+    ids=["inline // comment", "/* */ comment", "trailing comma"],
+)
+def test_a_json5_form_of_an_unchanged_config_gives_the_key_of_the_config(text):
+    clean_key = config_key(CONFIG)
+    assert clean_key is not None
+    assert config_key(text) == clean_key
+
+
+def test_a_double_slash_in_a_string_stays_in_the_value():
+    text = '{"url": "http://example.com/a//b"} // comment'
+    assert canonical_config(text) == {"url": "http://example.com/a//b"}
+
+
+@pytest.mark.parametrize("text", ['{"a": 1', "not json", ""])
 def test_a_text_that_does_not_parse_has_no_key(text):
     assert config_key(text) is None
 

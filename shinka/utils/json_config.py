@@ -2,6 +2,8 @@
 
 The async runner rejects a proposal when its key is the key of an earlier
 config, and the proposal prompt gives an earlier config as its changed keys.
+A config parses as JSON5, as the task evaluator does: a comment or a trailing
+comma does not change the config.
 Each float becomes its float32 value: 0.0010000000474974513 and 0.001 are the
 same value. An int stays exact, thus an int and a float are different values.
 A bool is never equal to a number.
@@ -10,9 +12,8 @@ A bool is never equal to a number.
 import json
 from typing import Any, List, Optional, Tuple
 
+import json5
 import numpy as np
-
-from .languages import get_evolve_comment_prefix
 
 ABSENT_TEXT = "(absent)"
 # The value of a key that one side of a diff does not have
@@ -35,21 +36,18 @@ def to_float32(value: Any) -> Any:
     return value
 
 
-def canonical_config(text: str, language: str = "json") -> Any:
-    """Parse a config without its comment lines, with float32 floats.
+def canonical_config(text: str) -> Any:
+    """Parse a config as JSON5, with float32 floats.
 
     Raise ValueError when the text does not parse.
     """
-    prefix = get_evolve_comment_prefix(language)
-    lines = text.splitlines()
-    kept = [line for line in lines if not line.lstrip().startswith(prefix)]
-    return to_float32(json.loads("\n".join(kept)))
+    return to_float32(json5.loads(text))
 
 
-def config_key(text: str, language: str = "json") -> Optional[str]:
+def config_key(text: str) -> Optional[str]:
     """Return the key of a config, or None when the text does not parse."""
     try:
-        return json.dumps(canonical_config(text, language), sort_keys=True)
+        return json.dumps(canonical_config(text), sort_keys=True)
     except ValueError:
         return None
 
@@ -95,16 +93,14 @@ def format_config_value(value: Any) -> str:
     return json.dumps(value)
 
 
-def config_diff_lines(
-    earlier_text: str, current_text: str, language: str = "json"
-) -> Optional[List[str]]:
+def config_diff_lines(earlier_text: str, current_text: str) -> Optional[List[str]]:
     """Return one "path: earlier -> current" line for each changed leaf.
 
     Return None when one of the two texts does not parse.
     """
     try:
-        earlier = canonical_config(earlier_text, language)
-        current = canonical_config(current_text, language)
+        earlier = canonical_config(earlier_text)
+        current = canonical_config(current_text)
     except ValueError:
         return None
     return [

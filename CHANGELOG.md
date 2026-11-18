@@ -8,7 +8,9 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 - For a `json` or `json5` task, the async runner rejects a proposal only when
   its config is a copy. A copy has the config of a program of the database, or
-  of a proposal in flight. The check compares each float as its float32 value.
+  of a proposal in flight. The check parses a config as JSON5, as the task
+  evaluator does, with the new `json5` dependency (`>=0.13.0`). It compares
+  each float as its float32 value.
   This copy check replaces the novelty check: the embedding threshold and the
   novelty LLM do not apply to a JSON task. Before, the novelty check ran only
   with `novelty_llm_models` set, and its embedding threshold also rejected

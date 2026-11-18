@@ -50,7 +50,7 @@ def format_prior_program(
     goes in full.
     """
     if parent is not None and is_json_language(language):
-        lines = config_diff_lines(program.code, parent.code, language)
+        lines = config_diff_lines(program.code, parent.code)
         if lines is not None:
             changes = "\n".join(lines) if lines else "no changed keys"
             return (
