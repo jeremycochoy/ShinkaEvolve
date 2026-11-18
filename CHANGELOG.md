@@ -38,6 +38,11 @@ All notable changes to `shinka-evolve` are documented in this file.
   the next tag, also at a wrong end tag such as `</DESCRIPTION>`.
 - Fixed the async runner so that a failed meta update charges its cost to the
   live total and to the database, with an id of its own.
+- Fixed the claude-cli provider so that a query gets no MCP server. The
+  command now holds `--strict-mcp-config`. Before, a query could get the
+  claude.ai connectors of the account, for example Gmail and Google Drive:
+  about 30 tools and their instructions. `--tools ""` disables the built-in
+  tools only.
 - Fixed the async runner so a new job with the identifier of a stored job gets
   its own row. The identifier of a local job holds the PID of its process, and
   the system can give that PID to a new process, for example after a resume.
