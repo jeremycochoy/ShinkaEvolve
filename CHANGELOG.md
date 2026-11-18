@@ -24,9 +24,11 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 - Fixed the local launcher so that an error after the start of the job
   process stops that process. When a log file open or a log thread start has
-  an error, the launcher kills the process and waits for it. Then it closes
-  the open log files and raises the error again. Before, the process continued
-  and the runner did not know about it.
+  an error, the launcher kills the process and waits for it. Then it waits for
+  each started log thread, for 5 s at most. The thread writes the last lines of
+  its pipe to its log file and closes the pipe. Then the launcher closes each
+  pipe that has no thread and the open log files, and raises the error again.
+  Before, the process continued and the runner did not know about it.
 - Fixed the async runner so the meta summary continues across a resume. The
   runner saves the meta state to `meta_memory.json` in the results directory
   after each meta update and at the end of a run. A launch on a database with
