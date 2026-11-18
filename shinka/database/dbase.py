@@ -70,7 +70,9 @@ class DatabaseConfig:
     enforce_island_separation: bool = (
         True  # Enforce full island separation for inspirations
     )
-    island_selection_strategy: str = "uniform"  # Island sampling strategy: "uniform"/"equal"/"proportional"/"weighted"
+    island_selection_strategy: str = (
+        "uniform"  # Island sampling strategy: "uniform"/"equal"/"proportional"/"weighted"
+    )
 
     # Dynamic island spawning parameters (stagnation-based)
     enable_dynamic_islands: bool = False  # Enable stagnation-based island spawning
@@ -95,6 +97,9 @@ class DatabaseConfig:
     # Beam search parent selection parameters
     num_beams: int = 5
 
+    tournament_top_k: int = 8
+    tournament_num_draws: int = 3
+
     # Archive selection parameters
     archive_selection_strategy: str = "fitness"  # "fitness" or "crowding"
     # Criteria weights for archive selection (sign indicates direction):
@@ -102,6 +107,16 @@ class DatabaseConfig:
     #   Negative weight = lower is better (e.g., loc, complexity)
     # Weights represent relative importance after rank normalization
     archive_criteria: Dict[str, float] = field(default_factory=default_archive_criteria)
+
+    def __post_init__(self):
+        if self.parent_selection_strategy != "tournament":
+            return
+        for name in ("tournament_top_k", "tournament_num_draws"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.tournament_num_draws > self.tournament_top_k:
+            raise ValueError("tournament_num_draws must not exceed tournament_top_k")
 
 
 def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
@@ -441,8 +456,7 @@ class ProgramDatabase:
         self.cursor.execute("PRAGMA temp_store = MEMORY;")
         self.cursor.execute("PRAGMA foreign_keys = ON;")  # For data integrity
 
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS programs (
                 id TEXT PRIMARY KEY,
                 code TEXT NOT NULL,
@@ -469,8 +483,7 @@ class ProgramDatabase:
                 island_idx INTEGER,  -- Add island_idx to the schema
                 system_prompt_id TEXT  -- ID of system prompt that generated this program
             )
-            """
-        )
+            """)
 
         # Add indices for common query patterns
         idx_cmds = [
@@ -490,25 +503,20 @@ class ProgramDatabase:
         for cmd in idx_cmds:
             self.cursor.execute(cmd)
 
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS archive (
                 program_id TEXT PRIMARY KEY,
                 FOREIGN KEY (program_id) REFERENCES programs(id)
                     ON DELETE CASCADE
             )
-            """
-        )
+            """)
 
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS metadata_store (
                 key TEXT PRIMARY KEY, value TEXT
             )
-            """
-        )
-        self.cursor.execute(
-            """
+            """)
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS generation_event_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 generation INTEGER NOT NULL,
@@ -517,16 +525,12 @@ class ProgramDatabase:
                 details TEXT,
                 created_at REAL NOT NULL
             )
-            """
-        )
-        self.cursor.execute(
-            """
+            """)
+        self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_generation_event_log_generation
             ON generation_event_log(generation)
-            """
-        )
-        self.cursor.execute(
-            """
+            """)
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS attempt_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 generation INTEGER NOT NULL,
@@ -535,14 +539,11 @@ class ProgramDatabase:
                 details TEXT,
                 created_at REAL NOT NULL
             )
-            """
-        )
-        self.cursor.execute(
-            """
+            """)
+        self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_attempt_log_generation
             ON attempt_log(generation)
-            """
-        )
+            """)
 
         self.conn.commit()
 
@@ -589,8 +590,7 @@ class ProgramDatabase:
         # pipeline timing is present. compute_time should mirror evaluation
         # runtime, while pipeline_seconds stores end-to-end wall time.
         try:
-            self.cursor.execute(
-                """
+            self.cursor.execute("""
                 UPDATE programs
                 SET metadata = json_set(
                     metadata,
@@ -606,16 +606,14 @@ class ProgramDatabase:
                           COALESCE(json_extract(metadata, '$.evaluation_seconds'), 0.0)
                       ) > 1e-9
                   )
-                """
-            )
+                """)
             self.conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error during compute_time timing migration: {e}")
 
         # Migration 4: Ensure attempt_log exists for proposal-failure accounting.
         try:
-            self.cursor.execute(
-                """
+            self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS attempt_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     generation INTEGER NOT NULL,
@@ -624,14 +622,11 @@ class ProgramDatabase:
                     details TEXT,
                     created_at REAL NOT NULL
                 )
-                """
-            )
-            self.cursor.execute(
-                """
+                """)
+            self.cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_attempt_log_generation
                 ON attempt_log(generation)
-                """
-            )
+                """)
             self.conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error during attempt_log migration: {e}")
@@ -1284,9 +1279,7 @@ class ProgramDatabase:
             best_program_id=self.best_program_id,
             beam_search_parent_id=self.beam_search_parent_id,
             last_iteration=self.last_iteration,
-            update_metadata_func=None
-            if self.read_only
-            else self._update_metadata_in_db,
+            update_metadata_func=self._set_beam_search_parent_id,
             get_best_program_func=self.get_best_program,
         )
 
@@ -1470,9 +1463,7 @@ class ProgramDatabase:
             best_program_id=self.best_program_id,
             beam_search_parent_id=self.beam_search_parent_id,
             last_iteration=self.last_iteration,
-            update_metadata_func=None
-            if self.read_only
-            else self._update_metadata_in_db,
+            update_metadata_func=self._set_beam_search_parent_id,
             get_best_program_func=self.get_best_program,
         )
 
@@ -1586,12 +1577,16 @@ class ProgramDatabase:
         )
 
     @db_retry()
-    def get_best_program(self, metric: Optional[str] = None) -> Optional[Program]:
+    def get_best_program(
+        self,
+        metric: Optional[str] = None,
+        island_idx: Optional[int] = None,
+    ) -> Optional[Program]:
         if not self.cursor:
             raise ConnectionError("DB not connected.")
 
         # Attempt to use tracked best_program_id first if no specific metric
-        if metric is None and self.best_program_id:
+        if metric is None and island_idx is None and self.best_program_id:
             program = self.get(self.best_program_id)
             if program and program.correct:  # Ensure best program is correct
                 return program
@@ -1605,7 +1600,13 @@ class ProgramDatabase:
                 self.best_program_id = None
 
         # Fetch only correct programs and sort in Python.
-        self.cursor.execute("SELECT * FROM programs WHERE correct = 1")
+        if island_idx is not None:
+            self.cursor.execute(
+                "SELECT * FROM programs WHERE correct = 1 AND island_idx = ?",
+                (island_idx,),
+            )
+        else:
+            self.cursor.execute("SELECT * FROM programs WHERE correct = 1")
         all_rows = self.cursor.fetchall()
         if not all_rows:
             logger.debug("No correct programs found in database.")
@@ -1613,21 +1614,9 @@ class ProgramDatabase:
 
         programs = []
         for row_data in all_rows:
-            p_dict = dict(row_data)
-            p_dict["public_metrics"] = (
-                json.loads(p_dict["public_metrics"])
-                if p_dict.get("public_metrics")
-                else {}
-            )
-            p_dict["private_metrics"] = (
-                json.loads(p_dict["private_metrics"])
-                if p_dict.get("private_metrics")
-                else {}
-            )
-            p_dict["metadata"] = (
-                json.loads(p_dict["metadata"]) if p_dict.get("metadata") else {}
-            )
-            programs.append(Program.from_dict(p_dict))
+            program = self._program_from_row(row_data)
+            if program is not None:
+                programs.append(program)
 
         if not programs:
             return None
@@ -1645,11 +1634,18 @@ class ProgramDatabase:
                 reverse=True,
             )
             log_key = f"metric '{metric}'"
+        elif island_idx is not None:
+            best_program = programs[0]
+            for candidate in programs[1:]:
+                if self._is_better(candidate, best_program):
+                    best_program = candidate
+            sorted_p = [best_program]
+            log_key = "program ranking"
         elif any(p.combined_score is not None for p in programs):
             progs_with_cs = [p for p in programs if p.combined_score is not None]
             sorted_p = sorted(
                 progs_with_cs,
-                key=lambda p_item: p_item.combined_score or -float("inf"),
+                key=lambda p_item: p_item.combined_score,
                 reverse=True,
             )
             log_key = "combined_score"
@@ -1657,10 +1653,11 @@ class ProgramDatabase:
             progs_with_metrics = [p for p in programs if p.public_metrics]
             sorted_p = sorted(
                 progs_with_metrics,
-                key=lambda p_item: sum(p_item.public_metrics.values())
-                / len(p_item.public_metrics)
-                if p_item.public_metrics
-                else -float("inf"),
+                key=lambda p_item: (
+                    sum(p_item.public_metrics.values()) / len(p_item.public_metrics)
+                    if p_item.public_metrics
+                    else -float("inf")
+                ),
                 reverse=True,
             )
 
@@ -1671,7 +1668,9 @@ class ProgramDatabase:
         best_overall = sorted_p[0]
         logger.debug(f"Best correct program by {log_key}: {best_overall.id}")
 
-        if self.best_program_id != best_overall.id:  # Update ID if different
+        if (
+            island_idx is None and self.best_program_id != best_overall.id
+        ):  # Update ID if different
             logger.info(
                 "Updating tracked best program from "
                 f"'{self.best_program_id}' to '{best_overall.id}'."
@@ -1690,8 +1689,7 @@ class ProgramDatabase:
         """
         if not self.cursor:
             raise ConnectionError("DB not connected.")
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             WITH metadata_source AS (
                 SELECT
                     island_idx,
@@ -1807,8 +1805,7 @@ class ProgramDatabase:
             FROM telemetry
             GROUP BY island_idx
             ORDER BY island_idx
-            """
-        )
+            """)
         return [dict(row) for row in self.cursor.fetchall()]
 
     @db_retry()
@@ -1816,14 +1813,12 @@ class ProgramDatabase:
         """Get all programs from the database."""
         if not self.cursor:
             raise ConnectionError("DB not connected.")
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             SELECT p.*,
                    CASE WHEN a.program_id IS NOT NULL THEN 1 ELSE 0 END as in_archive
             FROM programs p
             LEFT JOIN archive a ON p.id = a.program_id
-            """
-        )
+            """)
         rows = self.cursor.fetchall()
         programs = [self._program_from_row(row) for row in rows]
         # Filter out any None values that might result from row processing errors
@@ -1933,8 +1928,7 @@ class ProgramDatabase:
         """
         if not self.cursor:
             raise ConnectionError("DB not connected.")
-        self.cursor.execute(
-            """
+        self.cursor.execute("""
             SELECT
                 p.id,
                 p.parent_id,
@@ -1959,8 +1953,7 @@ class ProgramDatabase:
                 CASE WHEN a.program_id IS NOT NULL THEN 1 ELSE 0 END as in_archive
             FROM programs p
             LEFT JOIN archive a ON p.id = a.program_id
-            """
-        )
+            """)
         rows = self.cursor.fetchall()
         summaries = []
         for row in rows:
@@ -2130,10 +2123,11 @@ class ProgramDatabase:
                 progs_with_metrics = [p for p in programs if p.public_metrics]
                 sorted_p = sorted(
                     progs_with_metrics,
-                    key=lambda p_item: sum(p_item.public_metrics.values())
-                    / len(p_item.public_metrics)
-                    if p_item.public_metrics
-                    else -float("inf"),
+                    key=lambda p_item: (
+                        sum(p_item.public_metrics.values()) / len(p_item.public_metrics)
+                        if p_item.public_metrics
+                        else -float("inf")
+                    ),
                     reverse=True,
                 )
 
@@ -2407,12 +2401,14 @@ class ProgramDatabase:
 
         if use_ranked:
             # Use rank-based scoring with archive context
-            # Include both programs for fair ranking
+            # Rank each program against the archive and the other program, so
+            # both are ranked in the same population and their own comparison
+            # counts
             context = [
                 p for p in archive_programs if p.id not in (program1.id, program2.id)
             ]
-            s1 = self._compute_archive_score_ranked(program1, context)
-            s2 = self._compute_archive_score_ranked(program2, context)
+            s1 = self._compute_archive_score_ranked(program1, context + [program2])
+            s2 = self._compute_archive_score_ranked(program2, context + [program1])
 
             if s1 != s2:
                 return s1 > s2
@@ -2718,6 +2714,20 @@ class ProgramDatabase:
         gens_since_improvement = current_generation - self.best_score_generation
 
         return gens_since_improvement >= threshold
+
+    def _set_beam_search_parent_id(
+        self,
+        key: str,
+        value: Optional[str],
+    ) -> None:
+        """Update beam-search state in memory and persist it when writable."""
+        if key != "beam_search_parent_id":
+            raise ValueError(f"Unexpected beam-search metadata key: {key}")
+
+        self.beam_search_parent_id = value
+
+        if not self.read_only:
+            self._update_metadata_in_db(key, value)
 
     def check_and_spawn_island_if_stagnant(self, current_generation: int) -> bool:
         """Check for stagnation and spawn a new island if needed.

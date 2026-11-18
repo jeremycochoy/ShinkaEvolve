@@ -156,7 +156,7 @@ class AsyncMetaSummarizer:
                 summarized_programs,
                 individual_summaries,
                 step1_cost,
-            ) = await self._step1_individual_summaries_async(programs_to_analyze)
+            ) = await self._summarize_programs_async(programs_to_analyze)
             total_meta_cost += step1_cost
             if not individual_summaries:
                 logger.error("Step 1 failed - no individual summaries generated")
@@ -328,74 +328,81 @@ class AsyncMetaSummarizer:
 
     async def _step1_individual_summaries_async(
         self, programs_to_analyze: List[Program]
-    ) -> Tuple[List[Program], str, float]:
-        """Async version of Step 1: Create individual summaries for each program using concurrent queries.
+    ) -> Tuple[Optional[str], float]:
+        """Async version of Step 1: Create individual summaries for each program using batch queries."""
+        _, summary, cost = await self._summarize_programs_async(programs_to_analyze)
+        return summary, cost
+
+    async def _summarize_programs_async(
+        self, programs_to_analyze: List[Program]
+    ) -> Tuple[List[Program], Optional[str], float]:
+        """Step 1 of a meta update: one summary for each program, in one batch.
 
         Returns the programs that got a summary, their combined summaries and
-        the cost of all queries.
+        the cost of all queries. A program with no answer or a blank answer
+        gets no summary: it waits for the next update.
         """
         if not programs_to_analyze:
             logger.warning("No programs to analyze in Step 1")
-            return [], "", 0.0
+            return [], None, 0.0
 
-        # Use one query for each program, all at the same time. Each query
-        # gives its program back, thus a summary always has the identifier
-        # of its program
+        user_messages = [
+            META_STEP1_USER_MSG.replace(
+                "{individual_program_msg}",
+                construct_individual_program_msg(
+                    program,
+                    language=self.sync_summarizer.language,
+                    include_text_feedback=self.sync_summarizer.use_text_feedback,
+                ),
+            )
+            for program in programs_to_analyze
+        ]
         num_programs = len(programs_to_analyze)
         logger.info(
-            f"==> Step 1 - Processing {num_programs} programs with concurrent async queries"
+            f"==> Step 1 - Processing {num_programs} programs with async batch query"
         )
-        results = await asyncio.gather(
-            *(self.summarize_program_async(p) for p in programs_to_analyze)
+        # Each result keeps the index of its program, thus a summary always
+        # has the identifier of its program
+        responses = await self.async_llm_client.batch_kwargs_query_indexed(
+            num_samples=num_programs,
+            msg=user_messages,
+            system_msg=META_STEP1_SYSTEM_MSG,
         )
-        total_cost = sum(cost for _, _, cost in results)
-        summarized = [(program, summary) for program, summary, _ in results if summary]
+
+        total_cost = 0.0
+        summarized: List[Tuple[Program, str]] = []
+        answered = set()
+        for index, response in responses or []:
+            program = programs_to_analyze[index]
+            if response is not None:
+                total_cost += response.cost or 0.0
+            if response and response.content and response.content.strip():
+                identifier = (
+                    f"Generation {program.generation} - "
+                    f"Patch Name {program.metadata['patch_name']} - "
+                    f"Correct Program: {program.correct}"
+                )
+                summary = f"{response.content.strip()}\n**Program Identifier:** {identifier}"
+                summarized.append((program, summary))
+                answered.add(index)
+        for index, program in enumerate(programs_to_analyze):
+            if index not in answered:
+                logger.warning(
+                    f"Step 1: No summary for program {program.id} "
+                    f"(generation {program.generation})"
+                )
         logger.info(
             f"==> Step 1 - {len(summarized)}/{num_programs} "
             f"individual summaries generated (cost: ${total_cost:.4f})"
         )
+        if not summarized:
+            logger.error("Step 1: No valid summaries generated")
+            return [], None, total_cost
 
         # Sort the summaries by generation, then join them with double newlines
-        summaries_by_gen = sorted(summarized, key=lambda x: x[0].generation)
-        final_summary = "\n\n".join(summary for _, summary in summaries_by_gen)
+        summarized.sort(key=lambda item: item[0].generation)
+        final_summary = "\n\n".join(summary for _, summary in summarized)
         return [program for program, _ in summarized], final_summary, total_cost
-
-    async def summarize_program_async(
-        self, program: Program
-    ) -> Tuple[Program, Optional[str], float]:
-        """Step 1 for one program: query its summary and add its identifier.
-
-        Returns the program, its summary and the cost of the query. The
-        summary is None when the answer is missing or blank, or after an error.
-        """
-        summary, cost = None, 0.0
-        try:
-            individual_program_msg = construct_individual_program_msg(
-                program,
-                language=self.sync_summarizer.language,
-                include_text_feedback=self.sync_summarizer.use_text_feedback,
-            )
-            user_msg = META_STEP1_USER_MSG.replace(
-                "{individual_program_msg}", individual_program_msg
-            )
-            response = await self.async_llm_client.query(
-                msg=user_msg,
-                system_msg=META_STEP1_SYSTEM_MSG,
-            )
-            if response is not None:
-                cost = response.cost or 0.0
-                if response.content and response.content.strip():
-                    identifier = f"Generation {program.generation} - Patch Name {program.metadata['patch_name']} - Correct Program: {program.correct}"
-                    summary = f"{response.content.strip()}\n**Program Identifier:** {identifier}"
-        except Exception as e:
-            logger.error(f"Step 1: Error for program {program.id}: {e}")
-
-        if summary is None:
-            logger.warning(
-                f"Step 1: No summary for program {program.id} "
-                f"(generation {program.generation})"
-            )
-        return program, summary, cost
 
     async def _step2_global_insights_async(
         self, individual_summaries: str, best_program: Optional[Program] = None
@@ -426,9 +433,9 @@ class AsyncMetaSummarizer:
             system_msg=META_STEP2_SYSTEM_MSG,
         )
 
-        if response is None:
+        if response is None or not response.content:
             logger.error("Step 2: Failed to get response from async meta LLM client")
-            return None, 0.0
+            return None, (response.cost or 0.0) if response else 0.0
 
         cost = response.cost or 0.0
         logger.info(f"==> Step 2 - Global insights generated (cost: ${cost:.4f})")
@@ -467,9 +474,9 @@ class AsyncMetaSummarizer:
             system_msg=META_STEP3_SYSTEM_MSG,
         )
 
-        if response is None:
+        if response is None or not response.content:
             logger.error("Step 3: Failed to get response from async meta LLM client")
-            return None, 0.0
+            return None, (response.cost or 0.0) if response else 0.0
 
         cost = response.cost or 0.0
         logger.info(f"==> Step 3 - Recommendations generated (cost: ${cost:.4f})")
@@ -487,7 +494,8 @@ class AsyncMetaSummarizer:
         after the update. An error of the output file goes to the log.
 
         Returns:
-            Tuple of (success, meta_cost)
+            Tuple of (success, meta_cost). After a failed update, meta_cost is
+            the cost of its billed queries, and the caller charges it.
         """
         if not self.async_llm_client:
             logger.info("No async meta LLM client configured, skipping final summary")
@@ -513,9 +521,8 @@ class AsyncMetaSummarizer:
                 logger.error(f"❌ Failed to write the meta output file: {e}")
             logger.info(f"Final meta summary completed (cost: ${meta_cost:.4f})")
             return True, meta_cost
-        else:
-            logger.warning("Final meta summary failed to generate recommendations")
-            return False, 0.0
+        logger.warning("Final meta summary failed to generate recommendations")
+        return False, meta_cost
 
     async def write_meta_output_async(self, results_dir: str) -> None:
         """Async version of write_meta_output - write files in thread pool."""

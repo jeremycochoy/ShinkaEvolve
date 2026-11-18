@@ -143,6 +143,21 @@ class StubMetaLLM:
             return StubResponse("")
         return StubResponse(f"1. Recommendation of {self.name} update {update}.")
 
+    async def batch_kwargs_query_indexed(self, num_samples, msg, system_msg):
+        """Answer the step 1 queries of one update, as the real client does.
+
+        A query with no answer or with an error gives no result, and the
+        results keep the index of their query.
+        """
+        answers = await asyncio.gather(
+            *(self.summarize(m) for m in msg), return_exceptions=True
+        )
+        return [
+            (index, answer)
+            for index, answer in enumerate(answers)
+            if answer is not None and not isinstance(answer, Exception)
+        ]
+
     async def summarize(self, msg):
         """Answer the step 1 query of one program.
 
@@ -563,7 +578,9 @@ def test_update_of_the_initial_program_writes_the_meta_state(tmp_path):
     assert next_launch.api_cost == pytest.approx(0.06)
 
 
-def test_launch_on_generation_0_only_adds_the_meta_costs_only(tmp_path, monkeypatch):
+def test_launch_on_generation_0_only_loads_the_costs_of_the_database(
+    tmp_path, monkeypatch
+):
     run_dir = tmp_path / "run"
 
     async def paid_embedding(self, exec_fname):
@@ -578,11 +595,11 @@ def test_launch_on_generation_0_only_adds_the_meta_costs_only(tmp_path, monkeypa
 
     # Launch 1 pays 1 embedding and the update of 1 program.
     assert first.api_cost == pytest.approx(0.5 + 0.03)
-    # Launch 2 is not a resume, thus its other costs start at 0: it pays 1
-    # embedding. Its state holds 2 updates, thus its total holds their cost.
-    assert second.api_cost == pytest.approx(0.5 + 0.03 + 0.03)
-    # With no meta summary, such a launch has no state: its total is its own cost.
-    assert third.api_cost == pytest.approx(0.5)
+    # As on main, each launch starts from the costs of the database, also a
+    # launch that is not a resume. Launch 2 then pays 1 embedding and 1
+    # update, and launch 3 pays 1 embedding.
+    assert second.api_cost == pytest.approx(2 * (0.5 + 0.03))
+    assert third.api_cost == pytest.approx(2 * (0.5 + 0.03) + 0.5)
 
 
 def test_launch_on_generation_0_only_continues_the_meta_state(tmp_path, caplog):
@@ -967,8 +984,11 @@ def stored_meta_costs(run_dir: Path) -> float:
         db.close()
 
 
-def stored_update_ids(run_dir: Path) -> list[str]:
-    """Give the id of each meta update whose cost the database holds."""
+def stored_update_ids(run_dir: Path, failed: bool = False) -> list[str]:
+    """Give the id of each meta update whose cost the database holds.
+
+    With failed, give the id of each charge of a failed meta update instead.
+    """
     config = DatabaseConfig(db_path=str(run_dir / "programs.sqlite"), num_islands=2)
     db = ProgramDatabase(config=config, embedding_model="", read_only=True)
     try:
@@ -976,6 +996,7 @@ def stored_update_ids(run_dir: Path) -> list[str]:
             update_id
             for p in db.get_evaluated_programs()
             for update_id in p.metadata.get("meta_cost_update_ids") or []
+            if update_id.startswith("failed-") == failed
         ]
     finally:
         db.close()
@@ -1762,7 +1783,7 @@ def final_readers_with_dynamic_islands(
 
 @pytest.mark.parametrize("path", ISLAND_COPY_PATHS)
 @pytest.mark.parametrize("failure", ISLAND_COPY_FAILURES)
-def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
+def test_island_copy_holds_no_meta_cost_as_on_main(
     tmp_path, monkeypatch, failure, path
 ):
     run_dir = tmp_path / "run"
@@ -1776,27 +1797,22 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     )
 
     # The new island 1 copies the program of the update after the update. As
-    # on main, the copy repeats the cost that its program has at that time, in
-    # the database and in the console summary. As on SakanaAI main, the final
-    # W&B table gives no cost to the copy.
+    # on main, a copy calls no API, thus it holds no cost: the database, the
+    # console summary and the final W&B table count each meta cost 1 time.
     copy_key = (update_generation, 1)
     stored = stored_meta_costs_by_generation(tmp_path / "reference", with_copies=True)
-    assert 0 < stored[copy_key] <= stored[update_generation]
+    assert stored[copy_key] == 0
+    assert stored[update_generation] > 0
     assert reference["console"]["Total Meta Cost"] == pytest.approx(
         round(sum(stored.values()), 2)
     )
-    # main writes the cost of an update of the setup or of a job with the
-    # metadata of its program, and a new island copies that metadata. Thus a
-    # cost write changes no row of the final table and no console summary of
-    # main, also the cost of the copy.
+    # The final readers merge the live costs with the costs of the database,
+    # thus a cost write that fails or commits late changes no final reader.
     assert result == reference
 
-    # A resume. Its final readers show the costs of the database. When the
-    # cost write commits after the copy, the copy gets the cost in the
-    # database at the end of the launch, as on main. When each try of the
-    # cost write fails, the database holds that cost for neither the program
-    # nor its copy, and the resume makes the update again. main keeps the
-    # cost of the copy: a limit of this design.
+    # A resume. Its final readers show the costs of the database. When each
+    # try of the cost write fails, the database does not hold that cost, and
+    # the resume makes the update again. The copy holds no cost in each case.
     resume = final_readers_with_dynamic_islands(
         run_dir, monkeypatch, path, "launch 2", []
     )
@@ -1805,7 +1821,7 @@ def test_island_copy_shows_the_meta_cost_of_its_program_as_on_main(
     assert resume["console"]["Total Meta Cost"] == pytest.approx(
         round(sum(stored.values()), 2)
     )
-    assert (stored[copy_key] > 0) == (failure != "fails 3 times")
+    assert stored[copy_key] == 0
 
 
 class HardStop(BaseException):
@@ -2248,6 +2264,10 @@ def test_update_with_no_cost_makes_no_cost_write(tmp_path):
     class FreeMetaLLM(StubMetaLLM):
         async def query(self, msg, system_msg):
             response = await super().query(msg, system_msg)
+            return StubResponse(response.content, cost=0.0)
+
+        async def summarize(self, msg):
+            response = await super().summarize(msg)
             return StubResponse(response.content, cost=0.0)
 
     summarizer = make_summarizer(FreeMetaLLM("launch 1"), tmp_path / STATE_FILE)
@@ -2715,15 +2735,67 @@ def test_each_save_holds_the_updates_whose_cost_the_database_holds(
     launch(run_dir, StubMetaLLM("launch 3"), [3], 5)
 
     # Each save holds each update whose cost the database holds, and no other.
+    # The database also holds the cost of the 2 failed updates.
     assert counts
     assert all(updates == stored for updates, stored in counts)
     assert counts[-1] == (4, 4)
+    assert len(stored_update_ids(run_dir, failed=True)) == 2
     assert meta_files(run_dir) == [
         "meta_1.txt",
         "meta_2.txt",
         "meta_3.txt",
         "meta_4.txt",
     ]
+
+
+# The failed meta update of each path: the interval, the generations of the
+# jobs, the cost of the failed update (3 queries for 1 program, 4 for 2
+# programs: step 3 bills a blank answer), and the cost of the later updates.
+FAILED_UPDATE_PATHS = {
+    "initial program": (1, [], 0.03, 0.03),
+    "completed job": (2, [1], 0.04, 0.04),
+    "final summary": (5, [1], 0.04, 0.0),
+}
+
+
+@pytest.mark.parametrize("path", FAILED_UPDATE_PATHS)
+def test_failed_meta_update_charges_its_cost(tmp_path, path):
+    run_dir = tmp_path / "run"
+    interval, generations, failed_cost, later_cost = FAILED_UPDATE_PATHS[path]
+
+    seen = launch(
+        run_dir, StubMetaLLM("launch 1", failing_updates={1}), generations, interval
+    )
+
+    # As on main, the cost of a failed meta update reaches the live total and
+    # the database. It has its own id, and the state holds no update for it.
+    assert seen.final_api_cost == pytest.approx(failed_cost + later_cost)
+    assert sum(stored_meta_costs_by_generation(run_dir).values()) == pytest.approx(
+        failed_cost + later_cost
+    )
+    assert len(stored_update_ids(run_dir, failed=True)) == 1
+    assert len(stored_update_ids(run_dir)) == (1 if later_cost else 0)
+
+
+@pytest.mark.parametrize("path", FAILED_UPDATE_PATHS)
+def test_meta_cost_survives_an_output_file_error(tmp_path, monkeypatch, path):
+    run_dir = tmp_path / "run"
+    interval, generations, cost, _ = FAILED_UPDATE_PATHS[path]
+
+    async def fail(self, results_dir):
+        raise OSError("output unavailable")
+
+    monkeypatch.setattr(AsyncMetaSummarizer, "write_meta_output_async", fail)
+    seen = launch(run_dir, StubMetaLLM("launch 1"), generations, interval)
+
+    # The update gives no output file, and the search goes on. The live total
+    # and the database hold the cost of the update.
+    assert not (run_dir / "meta").exists()
+    assert seen.final_api_cost == pytest.approx(cost)
+    assert sum(stored_meta_costs_by_generation(run_dir).values()) == pytest.approx(
+        cost
+    )
+    assert len(stored_update_ids(run_dir)) == 1
 
 
 @pytest.mark.parametrize("budget_used", [False, True])
@@ -3588,58 +3660,15 @@ def test_meta_costs_of_the_database_skip_the_island_copies(tmp_path):
     # island from a copy of the initial program.
     for generation in (1, 2, 3):
         db.add(make_program(f"gen-{generation}", generation, score=0.5))
-    # Each copy of the initial program repeats its meta cost.
+    # As on main, each copy of the initial program holds no meta cost.
     stored = [program.metadata.get("meta_cost") for program in db.get_all_programs()]
-    assert sum(cost or 0.0 for cost in stored) > 0.03
+    assert len(stored) > 4
+    assert sum(cost or 0.0 for cost in stored) == pytest.approx(0.03)
 
     runner = make_runner(tmp_path / "run", StubMetaLLM("launch 1"), meta_rec_interval=1)
     runner.db = db
 
     assert runner._get_meta_costs() == pytest.approx(0.03)
-    db.close()
-
-
-def test_each_island_copy_gives_its_source_program(tmp_path):
-    # The first program gets a copy on each other island.
-    config = DatabaseConfig(db_path=str(tmp_path / "first.sqlite"), num_islands=3)
-    db = ProgramDatabase(config=config, embedding_model="")
-    db.add(make_program("gen-0", generation=0, score=1.0))
-    copies = [p.id for p in db.get_all_programs() if p.id != "gen-0"]
-    assert db.island_manager.copy_sources == {copy_id: "gen-0" for copy_id in copies}
-    assert len(copies) == 2
-    db.close()
-
-    # Generation 1 is no better than generation 0, thus a new island gets a
-    # copy of the initial program and of its best correct child. The
-    # maintenance on the write queue gives the copies that it made.
-    config = DatabaseConfig(
-        db_path=str(tmp_path / "spawn.sqlite"),
-        num_islands=1,
-        enable_dynamic_islands=True,
-        stagnation_threshold=1,
-        island_spawn_subtree_size=2,
-    )
-    db = ProgramDatabase(config=config, embedding_model="")
-    db.add(make_program("gen-0", generation=0, score=1.0))
-    child = make_program("gen-1", generation=1, score=0.5)
-    child.parent_id = "gen-0"
-
-    async def add_then_maintain():
-        async_db = AsyncProgramDatabase(db)
-        try:
-            await async_db.add_program_async(child, defer_maintenance=True)
-            return await async_db.run_program_maintenance_async(child)
-        finally:
-            await async_db.close_async()
-
-    copy_sources = asyncio.run(add_then_maintain())
-
-    assert copy_sources == {
-        p.id: p.metadata["_spawned_from_program_id"]
-        for p in db.get_all_programs()
-        if p.metadata.get("_spawned_island")
-    }
-    assert sorted(copy_sources.values()) == ["gen-0", "gen-1"]
     db.close()
 
 
