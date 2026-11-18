@@ -158,10 +158,10 @@ check. The runner does not use `code_embed_sim_threshold` or
   not `1.0`), and a bool is not equal to a number.
 - The check rejects a proposal when its config is equal to the config of a
   program of the database (all islands, correct or not). It also rejects a
-  copy of a proposal in flight. A proposal that ends with no job, for example
-  after an error of the job submit, frees its config. The next novelty attempt
-  then samples a new parent and new inspirations. After `max_novelty_attempts`
-  copies, the generation gets no program.
+  copy of a proposal in flight. The next novelty attempt then samples a new
+  parent and new inspirations. After `max_novelty_attempts` copies, the
+  generation gets no program. A proposal that ends with no job, for example
+  after an error of the job submit, frees its config.
 - A resume reads the configs of the database again. It does not know the
   configs of the jobs in flight at the stop.
 - The proposal prompt gives each earlier config as its changed keys, against

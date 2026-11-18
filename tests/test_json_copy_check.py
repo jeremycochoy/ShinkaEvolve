@@ -3,6 +3,8 @@
 import asyncio
 import errno
 import logging
+import signal
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from shinka.core import EvolutionConfig
 from shinka.core.async_runner import ShinkaEvolveRunner
 from shinka.core.sampler import PromptSampler
 from shinka.database import DatabaseConfig, Program
+from shinka.launch import JobScheduler, LocalJobConfig, local
 from shinka.utils.json_config import config_key
 from shinka.utils.languages import get_language_extension
 
@@ -337,4 +340,40 @@ def test_a_proposal_cancelled_at_the_slot_wait_frees_its_key(tmp_path):
 
     asyncio.run(cancel_at_the_slot_wait())
 
+    assert config_key(NEW_CONFIG) not in runner.json_config_keys
+
+
+def test_a_log_open_error_after_the_process_start_kills_the_job_and_frees_the_key(
+    tmp_path, monkeypatch
+):
+    runner = _build_runner(tmp_path, ScriptedLLM([NEW_CONFIG]), max_novelty_attempts=1)
+    evaluator = tmp_path / "evaluate.py"
+    evaluator.write_text("import time\ntime.sleep(60)\n")
+    runner.scheduler = JobScheduler(
+        "local", LocalJobConfig(eval_program_path=str(evaluator))
+    )
+    # The stderr log is a directory: its open gives an error after Popen
+    (tmp_path / "gen_1" / "results" / "job_log.err").mkdir(parents=True)
+    processes = []
+
+    def popen(*args, **kwargs):
+        processes.append(subprocess.Popen(*args, **kwargs))
+        return processes[-1]
+
+    monkeypatch.setattr(
+        local, "subprocess", SimpleNamespace(Popen=popen, PIPE=subprocess.PIPE)
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+    runner.scheduler.shutdown()
+    returncode = processes[0].returncode
+    processes[0].kill()
+    processes[0].wait()
+
+    assert job is None
+    assert [failure["failure_stage"] for failure in runner.failures] == [
+        "evaluation_submit"
+    ]
+    assert "Is a directory" in runner.failures[0]["failure_reason"]
+    assert returncode == -signal.SIGKILL
     assert config_key(NEW_CONFIG) not in runner.json_config_keys
