@@ -83,6 +83,7 @@ from shinka.utils import (
     parse_time_to_seconds,
     truncate_log_tail,
 )
+from shinka.utils.json_config import config_key, is_json_language
 from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
@@ -273,8 +274,17 @@ def _validate_evo_config_model_env_access(evo_config: EvolutionConfig) -> None:
     )
 
 
+def json_in_flight_label(generation: int) -> str:
+    """Return the key-set label of a JSON proposal in flight."""
+    return f"gen {generation} (in flight)"
+
+
 class ShinkaEvolveRunner:
     """Fully async evolution runner with concurrent proposal generation."""
+
+    # JSON task: the config key of each program and of each proposal in
+    # flight, with its program id or generation. None for a code task.
+    json_config_keys: Optional[Dict[str, str]] = None
 
     def __init__(
         self,
@@ -1623,6 +1633,9 @@ class ShinkaEvolveRunner:
                         "generating initial program with LLM..."
                     )
                 await self._generate_initial_program()
+
+        if is_json_language(self.evo_config.language):
+            self._load_json_config_keys()
 
         self._log_wandb_population_progress()
 
@@ -3137,6 +3150,7 @@ class ShinkaEvolveRunner:
         code_embedding: Optional[List[float]] = None
 
         costs_transferred = False
+        job_tracked = False
         try:
             # Select LLM once per program generation (before all loops)
             model_sample_probs = None
@@ -3240,6 +3254,19 @@ class ShinkaEvolveRunner:
                 if meta_patch_data.get("non_retryable"):
                     break
 
+                # JSON task: the copy check replaces the novelty stage
+                if self.json_config_keys is not None:
+                    proposal_code = await self._read_file_async(exec_fname) or ""
+                    copy_of = self._check_json_config_copy(
+                        proposal_code, generation, attempt + 1
+                    )
+                    if copy_of is not None:
+                        last_failure_stage = "novelty"
+                        last_failure_reason = (
+                            f"Exact copy of the JSON config of {copy_of}"
+                        )
+                        continue
+
                 # Get code embedding (only once per successful patch)
                 if self.verbose:
                     logger.info(f"Getting code embedding for generation {generation}...")
@@ -3249,6 +3276,10 @@ class ShinkaEvolveRunner:
                     logger.info(
                         f"Code embedding completed for generation {generation} (cost: ${e_cost:.4f})"
                     )
+
+                if self.json_config_keys is not None:
+                    proposal_accepted = True
+                    break
 
                 if not code_embedding:
                     if self.novelty_judge:
@@ -3394,6 +3425,7 @@ class ShinkaEvolveRunner:
                     # Track job in both running list and submitted registry
                     self.running_jobs.append(running_job)
                     self.submitted_jobs[str(job_id)] = running_job
+                    job_tracked = True
 
                     # Trigger immediate job status check to catch fast-completing jobs
                     self.slot_available.set()
@@ -3476,6 +3508,10 @@ class ShinkaEvolveRunner:
                     pending_cost, "cancelled_proposal", generation
                 )
             raise
+        finally:
+            # JSON task: a proposal with no job frees its config key
+            if not job_tracked:
+                self._release_json_config_key(generation)
 
     async def _save_patch_attempt_async(
         self,
@@ -4371,6 +4407,81 @@ class ShinkaEvolveRunner:
 
         return await get_code_embedding_async(exec_fname, self.embedding_client)
 
+    def _load_json_config_keys(self) -> None:
+        """Load the config key of each program of the database (JSON task).
+
+        A resume rebuilds the key set in this step. The proposals in flight
+        at a stop are not in the database, thus their keys are lost.
+        """
+        self.json_config_keys = {}
+        for program in self.db.get_all_programs():
+            key = config_key(program.code)
+            if key is not None:
+                self.json_config_keys.setdefault(key, f"program {program.id}")
+        logger.info(
+            f"JSON COPY CHECK: {len(self.json_config_keys)} config keys "
+            "loaded from the database"
+        )
+
+    def _check_json_config_copy(
+        self, code: str, generation: int, attempt: int
+    ) -> Optional[str]:
+        """Return the program that has the same JSON config, or None.
+
+        For a new config, the key goes in the key set in the same step, with
+        no await: of two proposals in flight with one config, one goes through.
+        A proposal that ends with no job frees its key again
+        (_release_json_config_key).
+        """
+        attempt_text = f"{attempt}/{self.evo_config.max_novelty_attempts}"
+        key = config_key(code)
+        if key is None:
+            logger.info(
+                f"JSON COPY CHECK {attempt_text}: gen {generation} not checked, "
+                "the config does not parse"
+            )
+            return None
+        copy_of = self.json_config_keys.get(key)
+        if copy_of is not None:
+            logger.info(
+                f"JSON COPY CHECK {attempt_text}: rejected gen {generation}, "
+                f"same config as {copy_of}"
+            )
+            return copy_of
+        self.json_config_keys[key] = json_in_flight_label(generation)
+        logger.info(
+            f"JSON COPY CHECK {attempt_text}: accepted gen {generation}, "
+            "no program has the same config"
+        )
+        return None
+
+    def _release_json_config_key(self, generation: int) -> None:
+        """Remove the key of a proposal that ends with no job (JSON task).
+
+        Only a key with the in-flight label of this proposal goes: the key of
+        a stored program stays.
+        """
+        if self.json_config_keys is None:
+            return
+        label = json_in_flight_label(generation)
+        claimed = [
+            key for key, owner in self.json_config_keys.items() if owner == label
+        ]
+        for key in claimed:
+            del self.json_config_keys[key]
+            logger.info(
+                f"JSON COPY CHECK: gen {generation} ends with no job, "
+                "its config is free again"
+            )
+
+    def _record_json_config_key(self, program: Program) -> None:
+        """Give the key of a stored program the id of the program (JSON task)."""
+        if self.json_config_keys is None:
+            return
+        key = config_key(program.code)
+        if key is not None:
+            self.json_config_keys[key] = f"program {program.id}"
+
     async def _persist_program_metadata_async(self, program: Program) -> None:
         """Persist updated program metadata using a thread-local DB handle.
 
@@ -4734,6 +4845,7 @@ class ShinkaEvolveRunner:
                     logger.info(
                         f"✅ DB SUCCESS: Program {program.id} successfully added to database for {job.job_id} (gen {job.generation})"
                     )
+                    self._record_json_config_key(program)
                 else:
                     existing_program = None
                     if hasattr(self.async_db, "get_program_by_source_job_id_async"):

@@ -156,6 +156,7 @@ class PromptSampler:
                 sorted_inspirations,
                 language=self.language,
                 include_text_feedback=self.use_text_feedback,
+                parent=parent,
             )
         else:
             eval_history_msg = ""
@@ -198,6 +199,7 @@ class PromptSampler:
                 archive_inspirations,
                 top_k_inspirations,
                 language=self.language,
+                parent=parent,
             )
         elif patch_type == "paper":
             raise NotImplementedError("Paper edit not implemented.")
@@ -249,6 +251,7 @@ class PromptSampler:
                 language=self.language,
                 include_text_feedback=self.use_text_feedback,
                 correct=False,
+                parent=incorrect_program,
             )
         else:
             eval_history_msg = ""

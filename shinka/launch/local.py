@@ -112,24 +112,45 @@ def submit(
         env=env,
     )
 
-    # Open log files for writing with line buffering
-    stdout_file = open(stdout_path, "w", buffering=1)
-    stderr_file = open(stderr_path, "w", buffering=1)
+    log_files: list[TextIO] = []
+    started_threads: list[threading.Thread] = []
+    try:
+        # Open log files for writing with line buffering
+        log_files.append(open(stdout_path, "w", buffering=1))
+        log_files.append(open(stderr_path, "w", buffering=1))
+        stdout_file, stderr_file = log_files
 
-    # Start threads to stream output to files in real-time
-    stdout_thread = threading.Thread(
-        target=_stream_output,
-        args=(process.stdout, stdout_file, "STDOUT" if verbose else None),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_stream_output,
-        args=(process.stderr, stderr_file, "STDERR" if verbose else None),
-        daemon=True,
-    )
+        # Start threads to stream output to files in real-time
+        stdout_thread = threading.Thread(
+            target=_stream_output,
+            args=(process.stdout, stdout_file, "STDOUT" if verbose else None),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_stream_output,
+            args=(process.stderr, stderr_file, "STDERR" if verbose else None),
+            daemon=True,
+        )
 
-    stdout_thread.start()
-    stderr_thread.start()
+        for thread in (stdout_thread, stderr_thread):
+            thread.start()
+            started_threads.append(thread)
+    except BaseException:
+        # The caller gets no handle to stop the process, thus stop it here.
+        # The wait removes the dead process from the process table.
+        process.kill()
+        process.wait()
+        # A started thread writes the rest of its pipe to its log file, then
+        # closes the pipe. Wait for it before the log files close.
+        for thread in started_threads:
+            thread.join(timeout=5.0)
+        # The threads start in the order of the pipes. A pipe whose thread
+        # did not start has no reader to close it.
+        for pipe in (process.stdout, process.stderr)[len(started_threads) :]:
+            pipe.close()
+        for log_file in log_files:
+            log_file.close()
+        raise
 
     # Create wrapper with logging capabilities
     wrapped_process = ProcessWithLogging(

@@ -4,8 +4,31 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ## Unreleased (fork jeremycochoy/ShinkaEvolve)
 
+### Changed
+
+- For a `json` or `json5` task, the async runner rejects a proposal only when
+  its config is a copy. A copy has the config of a program of the database, or
+  of a proposal in flight. The check parses a config as JSON5, as the task
+  evaluator does, with the new `json5` dependency (`>=0.13.0`). It compares
+  each float as its float32 value.
+  This copy check replaces the novelty check: the embedding threshold and the
+  novelty LLM do not apply to a JSON task. Before, the novelty check ran only
+  with `novelty_llm_models` set, and its embedding threshold also rejected
+  configs with changed values (jeremycochoy/evolve_trading#192).
+- For a `json` or `json5` task, the proposal prompt gives each earlier config
+  as its changed keys against the config to edit. This applies to the
+  evaluation history, the fix prompt and the crossover part. A code task does
+  not change.
+
 ### Fixed
 
+- Fixed the local launcher so that an error after the start of the job
+  process stops that process. When a log file open or a log thread start has
+  an error, the launcher kills the process and waits for it. Then it waits for
+  each started log thread, for 5 s at most. The thread writes the last lines of
+  its pipe to its log file and closes the pipe. Then the launcher closes each
+  pipe that has no thread and the open log files, and raises the error again.
+  Before, the process continued and the runner did not know about it.
 - Fixed the async runner so the meta summary continues across a resume. The
   runner saves the meta state to `meta_memory.json` in the results directory
   after each meta update and at the end of a run. A launch on a database with
