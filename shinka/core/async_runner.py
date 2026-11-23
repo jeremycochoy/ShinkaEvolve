@@ -83,7 +83,13 @@ from shinka.utils import (
     parse_time_to_seconds,
     truncate_log_tail,
 )
-from shinka.utils.json_config import config_key, is_json_language
+from shinka.utils.json_config import (
+    Canonicalizer,
+    CanonicalizerError,
+    config_key,
+    is_json_language,
+    load_canonicalizer,
+)
 from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
@@ -285,6 +291,9 @@ class ShinkaEvolveRunner:
     # JSON task: the config key of each program and of each proposal in
     # flight, with its program id or generation. None for a code task.
     json_config_keys: Optional[Dict[str, str]] = None
+    # JSON task: the function that gives the config key
+    # (EvolutionConfig.json_canonicalizer). None: the float32 JSON text.
+    json_canonicalizer: Optional[Canonicalizer] = None
 
     def __init__(
         self,
@@ -325,6 +334,11 @@ class ShinkaEvolveRunner:
         )
         pricing_snapshot = pricing_snapshot or refresh_model_catalog()
         _validate_evo_config_model_env_access(evo_config)
+        # JSON task: an import error stops the run before it writes a file
+        if is_json_language(evo_config.language) and evo_config.json_canonicalizer:
+            self.json_canonicalizer = load_canonicalizer(
+                evo_config.json_canonicalizer, evo_config.json_canonicalizer_path
+            )
 
         self.verbose = verbose
         # Setup results directory first
@@ -3257,14 +3271,12 @@ class ShinkaEvolveRunner:
                 # JSON task: the copy check replaces the novelty stage
                 if self.json_config_keys is not None:
                     proposal_code = await self._read_file_async(exec_fname) or ""
-                    copy_of = self._check_json_config_copy(
+                    rejection = self._check_json_config_copy(
                         proposal_code, generation, attempt + 1
                     )
-                    if copy_of is not None:
+                    if rejection is not None:
                         last_failure_stage = "novelty"
-                        last_failure_reason = (
-                            f"Exact copy of the JSON config of {copy_of}"
-                        )
+                        last_failure_reason = rejection
                         continue
 
                 # Get code embedding (only once per successful patch)
@@ -4415,7 +4427,7 @@ class ShinkaEvolveRunner:
         """
         self.json_config_keys = {}
         for program in self.db.get_all_programs():
-            key = config_key(program.code)
+            key = self._program_config_key(program)
             if key is not None:
                 self.json_config_keys.setdefault(key, f"program {program.id}")
         logger.info(
@@ -4423,18 +4435,41 @@ class ShinkaEvolveRunner:
             "loaded from the database"
         )
 
+    def _program_config_key(self, program: Program) -> Optional[str]:
+        """Return the config key of a stored program, or None (JSON task).
+
+        A config that does not parse, or that the canonicalizer refuses, has
+        no key.
+        """
+        try:
+            return config_key(program.code, self.json_canonicalizer)
+        except CanonicalizerError as error:
+            logger.warning(
+                f"JSON COPY CHECK: program {program.id} has no config key, "
+                f"the canonicalizer refuses its config: {error}"
+            )
+            return None
+
     def _check_json_config_copy(
         self, code: str, generation: int, attempt: int
     ) -> Optional[str]:
-        """Return the program that has the same JSON config, or None.
+        """Return the reason to reject a JSON config, or None.
 
-        For a new config, the key goes in the key set in the same step, with
-        no await: of two proposals in flight with one config, one goes through.
-        A proposal that ends with no job frees its key again
-        (_release_json_config_key).
+        The canonicalizer can refuse the config, or the config can be a copy
+        of the config of a program. For a new config, the key goes in the key
+        set in the same step, with no await: of two proposals in flight with
+        one config, one goes through. A proposal that ends with no job frees
+        its key again (_release_json_config_key).
         """
         attempt_text = f"{attempt}/{self.evo_config.max_novelty_attempts}"
-        key = config_key(code)
+        try:
+            key = config_key(code, self.json_canonicalizer)
+        except CanonicalizerError as error:
+            logger.info(
+                f"JSON COPY CHECK {attempt_text}: rejected gen {generation}, "
+                f"the canonicalizer refuses the config: {error}"
+            )
+            return f"The canonicalizer refuses the JSON config: {error}"
         if key is None:
             logger.info(
                 f"JSON COPY CHECK {attempt_text}: gen {generation} not checked, "
@@ -4447,7 +4482,7 @@ class ShinkaEvolveRunner:
                 f"JSON COPY CHECK {attempt_text}: rejected gen {generation}, "
                 f"same config as {copy_of}"
             )
-            return copy_of
+            return f"Copy of the JSON config of {copy_of}"
         self.json_config_keys[key] = json_in_flight_label(generation)
         logger.info(
             f"JSON COPY CHECK {attempt_text}: accepted gen {generation}, "
@@ -4478,7 +4513,7 @@ class ShinkaEvolveRunner:
         """Give the key of a stored program the id of the program (JSON task)."""
         if self.json_config_keys is None:
             return
-        key = config_key(program.code)
+        key = self._program_config_key(program)
         if key is not None:
             self.json_config_keys[key] = f"program {program.id}"
 

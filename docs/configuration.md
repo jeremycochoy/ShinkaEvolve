@@ -63,6 +63,8 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 | `code_embed_sim_threshold` | `float` | `0.99` | Similarity threshold used by novelty checks. No effect for a JSON task. |
 | `novelty_llm_models` | `Optional[List[str]]` | `None` | Optional novelty-judge model pool. No effect for a JSON task. |
 | `novelty_llm_kwargs` | `dict` | `{}` | kwargs for novelty-judge LLM calls. |
+| `json_canonicalizer` | `Optional[str]` | `None` | For a JSON task, the `module:function` that gives the key of the copy check. See [JSON tasks](#json-tasks). |
+| `json_canonicalizer_path` | `Optional[str]` | `None` | A directory that goes first in `sys.path` before the import of `json_canonicalizer`. A relative path starts at the working directory. |
 | `use_text_feedback` | `bool` | `False` | Include text feedback in mutation prompts. |
 | `max_api_costs` | `Optional[float]` | `None` | API budget cap in USD; stops new submissions at cap. |
 | `enable_controlled_oversubscription` | `bool` | `False` | Enable bounded proposal oversubscription when proposal generation is slower than evaluation. |
@@ -156,6 +158,19 @@ check. The runner does not use `code_embed_sim_threshold` or
   The check changes each float to its float32 value. Thus `0.001` and
   `0.0010000000474974513` are equal. An int is not equal to a float (`1` is
   not `1.0`), and a bool is not equal to a number.
+- A task can set the function that compares two configs in
+  `json_canonicalizer`, as `module:function`. The function gets the config as
+  `json5.loads` gives it. Two configs are then equal when the function gives
+  two values with the same JSON text, with sorted keys. The function sets the
+  full rule, also the rule of the floats. For example, a config that writes a
+  key at its default and the same config without the key can get one value.
+  The runner imports the function at its start, with `json_canonicalizer_path`
+  first in `sys.path` when it is set. An import error stops the run before it
+  writes a file.
+- When the function raises an error for a proposal, the check rejects the
+  proposal as it rejects a copy. The reason of the rejection holds the error.
+  When the function refuses the config of a program of the database, the
+  program has no key.
 - The check rejects a proposal when its config is equal to the config of a
   program of the database (all islands, correct or not). It also rejects a
   copy of a proposal in flight. The next novelty attempt then samples a new

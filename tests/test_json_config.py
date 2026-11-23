@@ -2,6 +2,7 @@
 of the earlier configs in the proposal prompt."""
 
 import random
+from pathlib import Path
 
 import pytest
 
@@ -9,10 +10,12 @@ from shinka.core.sampler import PromptSampler
 from shinka.database import Program
 from shinka.prompts import construct_eval_history_msg, get_cross_component
 from shinka.utils.json_config import (
+    CanonicalizerError,
     canonical_config,
     config_diff_lines,
     config_key,
     is_json_language,
+    load_canonicalizer,
 )
 
 CONFIG = """{
@@ -95,6 +98,86 @@ def test_a_double_slash_in_a_string_stays_in_the_value():
 @pytest.mark.parametrize("text", ['{"a": 1', "not json", ""])
 def test_a_text_that_does_not_parse_has_no_key(text):
     assert config_key(text) is None
+
+
+SPEC = """{
+    "data_configuration": {"freq": "240s"},
+    "model_configuration": {"T": 32, "leverage": 1},
+    "train_configuration": {"lr": 0.001}
+}
+"""
+NO_LEVERAGE = SPEC.replace(', "leverage": 1', "")
+
+
+@pytest.fixture
+def spec_key(canonicalizer_dir):
+    return load_canonicalizer("spec_keys:spec_key", canonicalizer_dir)
+
+
+def test_a_canonicalizer_gives_one_key_to_a_key_at_its_default_and_no_key(
+    spec_key,
+):
+    assert config_key(NO_LEVERAGE, spec_key) == config_key(SPEC, spec_key)
+
+
+def test_with_a_canonicalizer_a_change_of_lr_is_a_new_key(spec_key):
+    other = SPEC.replace('"lr": 0.001', '"lr": 0.003')
+    assert config_key(other, spec_key) != config_key(SPEC, spec_key)
+
+
+def test_with_a_canonicalizer_a_change_of_a_data_value_is_a_new_key(spec_key):
+    other = SPEC.replace('"240s"', '"120s"')
+    assert config_key(other, spec_key) != config_key(SPEC, spec_key)
+
+
+def test_without_a_canonicalizer_a_key_at_its_default_is_a_new_key():
+    assert config_key(NO_LEVERAGE) != config_key(SPEC)
+
+
+def test_an_error_of_the_canonicalizer_gives_a_canonicalizer_error(
+    canonicalizer_dir,
+):
+    strict = load_canonicalizer("spec_keys:strict_spec_key", canonicalizer_dir)
+    with pytest.raises(CanonicalizerError, match="ValueError: model_configuration.T"):
+        config_key(SPEC.replace('"T": 32', '"T": "32"'), strict)
+
+
+def test_a_canonicalizer_value_with_no_json_text_gives_a_canonicalizer_error():
+    with pytest.raises(CanonicalizerError, match="TypeError"):
+        config_key(SPEC, lambda config: {"keys": {1, 2}})
+
+
+def test_a_text_that_does_not_parse_has_no_key_with_a_canonicalizer():
+    def no_call(config):
+        raise AssertionError("the canonicalizer gets only a parsed config")
+
+    assert config_key('{"a": 1', no_call) is None
+
+
+def test_a_relative_canonicalizer_path_starts_at_the_working_directory(
+    canonicalizer_dir, monkeypatch
+):
+    monkeypatch.chdir(Path(canonicalizer_dir).parent)
+    function = load_canonicalizer("spec_keys:spec_key", "canonicalizer")
+    assert config_key(NO_LEVERAGE, function) == config_key(SPEC, function)
+
+
+@pytest.mark.parametrize(
+    "target, error",
+    [
+        ("spec_keys", "write module:function"),
+        ("spec_keys:no_such_function", "AttributeError"),
+        ("no_such_module:spec_key", "ModuleNotFoundError"),
+        ("spec_keys:DEFAULT_LEVERAGE", "not a function"),
+    ],
+)
+def test_a_target_that_gives_no_function_stops_with_its_name(
+    canonicalizer_dir, target, error
+):
+    with pytest.raises(ValueError) as info:
+        load_canonicalizer(target, canonicalizer_dir)
+    assert repr(target) in str(info.value)
+    assert error in str(info.value)
 
 
 def test_diff_gives_the_dotted_path_of_a_nested_leaf():

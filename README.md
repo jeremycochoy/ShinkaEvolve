@@ -267,6 +267,8 @@ Class defaults below come from `shinka/core/config.py` (`EvolutionConfig`). Hydr
 | `code_embed_sim_threshold` | `0.99` | `float` | Similarity threshold for code embeddings. No effect for a `json` or `json5` task: a copy check replaces the novelty check ([JSON tasks](docs/configuration.md#json-tasks)) |
 | `novelty_llm_models` | `None` | `Optional[List[str]]` | LLM models for novelty judgment. No effect for a `json` or `json5` task |
 | `novelty_llm_kwargs` | `{}` | `dict` | Kwargs for novelty LLMs |
+| `json_canonicalizer` | `None` | `Optional[str]` | `module:function` that gives the key of the copy check of a JSON task ([JSON tasks](docs/configuration.md#json-tasks)) |
+| `json_canonicalizer_path` | `None` | `Optional[str]` | Directory that goes first in `sys.path` before the import of `json_canonicalizer` |
 | `use_text_feedback` | `False` | `bool` | Whether to use text feedback in evolution |
 | `max_api_costs` | `None` | `Optional[float]` | Total API budget cap (USD); async runner stops new proposals at cap |
 | `enable_controlled_oversubscription` | `False` | `bool` | Enable bounded proposal oversubscription when proposal generation is slower than evaluation. |
