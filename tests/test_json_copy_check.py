@@ -11,12 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from shinka.core import EvolutionConfig
+from shinka.core import EvolutionConfig, async_runner
 from shinka.core.async_runner import ShinkaEvolveRunner
 from shinka.core.sampler import PromptSampler
 from shinka.database import DatabaseConfig, Program
 from shinka.launch import JobScheduler, LocalJobConfig, local
-from shinka.utils.json_config import config_key
+from shinka.pricing.catalog import PricingConfig, PricingMode, refresh_model_catalog
+from shinka.utils.json_config import config_key, load_canonicalizer
 from shinka.utils.languages import get_language_extension
 
 PARENT_CODE = """{
@@ -29,6 +30,20 @@ PARENT_CODE = """{
 NOISE_COPY = PARENT_CODE.replace('"lr": 0.001', '"lr": 0.0010000000474974513')
 NEW_CONFIG = PARENT_CODE.replace('"lr": 0.001', '"lr": 0.003')
 PYTHON_CODE = "# EVOLVE-BLOCK-START\nx = 1\n# EVOLVE-BLOCK-END\n"
+# A spec with its 3 sections in the evolve block: a full rewrite can change
+# each section
+SPEC = """{
+// EVOLVE-BLOCK-START
+    "data_configuration": {"freq": "240s"},
+    "model_configuration": {"T": 32, "leverage": 1},
+    "train_configuration": {"lr": 0.001}
+// EVOLVE-BLOCK-END
+}
+"""
+SPEC_NO_LEVERAGE = SPEC.replace(', "leverage": 1', "")
+SPEC_NEW_LR = SPEC.replace('"lr": 0.001', '"lr": 0.003')
+SPEC_NEW_DATA = SPEC.replace('"240s"', '"120s"')
+SPEC_REFUSED = SPEC.replace('"T": 32', '"T": "32"')
 
 
 class ScriptedLLM:
@@ -74,8 +89,16 @@ class Scheduler:
         return f"job-{len(self.submitted)}"
 
 
-def _build_runner(tmp_path, llm, language="json", max_novelty_attempts=3):
-    parent_code = PARENT_CODE if language == "json" else PYTHON_CODE
+def _build_runner(
+    tmp_path,
+    llm,
+    language="json",
+    max_novelty_attempts=3,
+    parent_code=None,
+    canonicalizer=None,
+):
+    if parent_code is None:
+        parent_code = PARENT_CODE if language == "json" else PYTHON_CODE
     parent = Program(id="parent-1", code=parent_code, language=language, correct=True)
     runner = object.__new__(ShinkaEvolveRunner)
     runner.evo_config = EvolutionConfig(
@@ -129,6 +152,7 @@ def _build_runner(tmp_path, llm, language="json", max_novelty_attempts=3):
     )
     runner._save_patch_attempt_async = save_patch_attempt
     runner._record_terminal_failed_proposal = record_failure
+    runner.json_canonicalizer = canonicalizer
     if language == "json":
         runner._load_json_config_keys()
     return runner
@@ -377,3 +401,202 @@ def test_a_log_open_error_after_the_process_start_kills_the_job_and_frees_the_ke
     assert "Is a directory" in runner.failures[0]["failure_reason"]
     assert returncode == -signal.SIGKILL
     assert config_key(NEW_CONFIG) not in runner.json_config_keys
+
+
+@pytest.fixture
+def spec_key(canonicalizer_dir):
+    return load_canonicalizer("spec_keys:spec_key", canonicalizer_dir)
+
+
+@pytest.fixture
+def strict_spec_key(canonicalizer_dir):
+    return load_canonicalizer("spec_keys:strict_spec_key", canonicalizer_dir)
+
+
+def test_a_canonicalizer_rejects_a_config_of_the_same_run(
+    tmp_path, spec_key, caplog
+):
+    caplog.set_level(logging.INFO, logger="shinka.core.async_runner")
+    runner = _build_runner(
+        tmp_path,
+        ScriptedLLM([SPEC_NO_LEVERAGE, SPEC_NEW_LR]),
+        parent_code=SPEC,
+        canonicalizer=spec_key,
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+
+    assert job is not None
+    assert runner.samples == [1, 2]
+    assert [config_key(code) for code in runner.scheduler.submitted] == [
+        config_key(SPEC_NEW_LR)
+    ]
+    assert _copy_check_lines(caplog, "rejected") == [
+        "JSON COPY CHECK 1/3: rejected gen 1, same config as program parent-1"
+    ]
+
+
+def test_with_a_canonicalizer_a_change_of_a_data_value_is_a_new_config(
+    tmp_path, spec_key
+):
+    runner = _build_runner(
+        tmp_path,
+        ScriptedLLM([SPEC_NEW_DATA]),
+        max_novelty_attempts=1,
+        parent_code=SPEC,
+        canonicalizer=spec_key,
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+
+    assert job is not None
+    assert [config_key(code) for code in runner.scheduler.submitted] == [
+        config_key(SPEC_NEW_DATA)
+    ]
+
+
+def test_without_a_canonicalizer_a_key_at_its_default_is_a_new_config(tmp_path):
+    runner = _build_runner(
+        tmp_path,
+        ScriptedLLM([SPEC_NO_LEVERAGE]),
+        max_novelty_attempts=1,
+        parent_code=SPEC,
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+
+    assert job is not None
+    assert runner.failures == []
+
+
+def test_a_config_that_the_canonicalizer_refuses_goes_to_the_next_attempt(
+    tmp_path, strict_spec_key, caplog
+):
+    caplog.set_level(logging.INFO, logger="shinka.core.async_runner")
+    runner = _build_runner(
+        tmp_path,
+        ScriptedLLM([SPEC_REFUSED, SPEC_NEW_LR]),
+        parent_code=SPEC,
+        canonicalizer=strict_spec_key,
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+
+    assert job is not None
+    assert runner.samples == [1, 2]
+    assert [config_key(code) for code in runner.scheduler.submitted] == [
+        config_key(SPEC_NEW_LR)
+    ]
+    assert _copy_check_lines(caplog, "rejected") == [
+        "JSON COPY CHECK 1/3: rejected gen 1, the canonicalizer refuses the "
+        "config: ValueError: model_configuration.T: the format needs an integer"
+    ]
+
+
+def test_a_round_of_refused_configs_gives_the_error_as_the_reason(
+    tmp_path, strict_spec_key
+):
+    runner = _build_runner(
+        tmp_path,
+        ScriptedLLM([SPEC_REFUSED]),
+        max_novelty_attempts=1,
+        parent_code=SPEC,
+        canonicalizer=strict_spec_key,
+    )
+
+    job = asyncio.run(_propose(runner, generation=1))
+
+    assert job is None
+    assert runner.scheduler.submitted == []
+    assert [failure["failure_stage"] for failure in runner.failures] == ["novelty"]
+    assert runner.failures[0]["failure_reason"] == (
+        "The canonicalizer refuses the JSON config: ValueError: "
+        "model_configuration.T: the format needs an integer"
+    )
+    assert list(runner.json_config_keys.values()) == ["program parent-1"]
+
+
+def test_a_program_that_the_canonicalizer_refuses_has_no_key(
+    tmp_path, strict_spec_key, caplog
+):
+    runner = _build_runner(
+        tmp_path, ScriptedLLM([]), parent_code=SPEC, canonicalizer=strict_spec_key
+    )
+    runner.db = SimpleNamespace(
+        get_all_programs=lambda: [
+            Program(id="parent-1", code=SPEC, language="json"),
+            Program(id="refused-1", code=SPEC_REFUSED, language="json"),
+        ]
+    )
+
+    runner._load_json_config_keys()
+    runner._record_json_config_key(
+        Program(id="refused-2", code=SPEC_REFUSED, language="json")
+    )
+
+    assert runner.json_config_keys == {
+        config_key(SPEC, strict_spec_key): "program parent-1"
+    }
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 2
+    assert "program refused-1 has no config key" in warnings[0]
+    assert "program refused-2 has no config key" in warnings[1]
+
+
+@pytest.fixture
+def offline_runner(monkeypatch, tmp_path):
+    """Build a full runner with the packaged prices and no check of the models."""
+    config = PricingConfig(mode=PricingMode.OFFLINE, cache_dir=tmp_path / "prices")
+    monkeypatch.setattr(
+        async_runner, "refresh_model_catalog", lambda: refresh_model_catalog(config)
+    )
+    monkeypatch.setattr(
+        async_runner, "_validate_evo_config_model_env_access", lambda evo_config: None
+    )
+    yield
+    refresh_model_catalog(config)
+
+
+def _full_runner(tmp_path, **evo_options):
+    return ShinkaEvolveRunner(
+        evo_config=EvolutionConfig(
+            language="json",
+            llm_models=["stub-model"],
+            llm_dynamic_selection=None,
+            meta_rec_interval=None,
+            embedding_model=None,
+            num_generations=1,
+            results_dir=str(tmp_path / "results"),
+            **evo_options,
+        ),
+        job_config=LocalJobConfig(),
+        db_config=DatabaseConfig(),
+        verbose=False,
+    )
+
+
+def test_the_runner_imports_the_canonicalizer_of_a_json_task(
+    tmp_path, offline_runner, canonicalizer_dir
+):
+    runner = _full_runner(
+        tmp_path,
+        json_canonicalizer="spec_keys:spec_key",
+        json_canonicalizer_path=canonicalizer_dir,
+    )
+
+    canonicalizer = runner.json_canonicalizer
+    assert config_key(SPEC_NO_LEVERAGE, canonicalizer) == config_key(
+        SPEC, canonicalizer
+    )
+
+
+def test_a_canonicalizer_that_does_not_import_stops_the_runner_at_its_start(
+    tmp_path, offline_runner
+):
+    with pytest.raises(ValueError, match="'no_such_module:spec_key'"):
+        _full_runner(tmp_path, json_canonicalizer="no_such_module:spec_key")
+    assert not (tmp_path / "results").exists()

@@ -60,6 +60,10 @@ class EvolutionConfig:
     code_embed_sim_threshold: float = 0.99
     novelty_llm_models: Optional[List[str]] = None
     novelty_llm_kwargs: dict = field(default_factory=lambda: {})
+    # JSON task: the "module:function" that gives the key of the copy check,
+    # and a directory that goes first in sys.path for its import
+    json_canonicalizer: Optional[str] = None
+    json_canonicalizer_path: Optional[str] = None
     use_text_feedback: bool = False
     max_api_costs: Optional[float] = None
     inspiration_sort_order: str = "ascending"
