@@ -4,6 +4,18 @@ All notable changes to `shinka-evolve` are documented in this file.
 
 ## Unreleased (fork jeremycochoy/ShinkaEvolve)
 
+### Added
+
+- A `json` or `json5` task can set the function that compares its configs in
+  `json_canonicalizer` (`module:function`). An optional
+  `json_canonicalizer_path` goes first in `sys.path`. The function gets the
+  parsed config. The JSON text of its value is the key of the config. Thus two
+  configs of the same run can have one key. An example is a config with a key
+  at its default and the same config without the key. When the function raises
+  an error for a proposal, the runner rejects the proposal, with the error in
+  the reason. An import error stops the run at its start. Without the option,
+  the check does not change.
+
 ### Changed
 
 - For a `json` or `json5` task, the async runner rejects a proposal only when

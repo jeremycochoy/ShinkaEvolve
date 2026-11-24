@@ -7,10 +7,16 @@ comma does not change the config.
 Each float becomes its float32 value: 0.0010000000474974513 and 0.001 are the
 same value. An int stays exact, thus an int and a float are different values.
 A bool is never equal to a number.
+A task can give a canonicalizer: a function of the parsed config that gives
+the key. Then two configs of the same run can have the same key, for example
+a config that writes a key at its default and a config without the key.
 """
 
+import importlib
 import json
-from typing import Any, List, Optional, Tuple
+import os
+import sys
+from typing import Any, Callable, List, Optional, Tuple
 
 import json5
 import numpy as np
@@ -18,6 +24,13 @@ import numpy as np
 ABSENT_TEXT = "(absent)"
 # The value of a key that one side of a diff does not have
 _ABSENT = object()
+
+# A function of the parsed config. The JSON text of its value is the key
+Canonicalizer = Callable[[Any], Any]
+
+
+class CanonicalizerError(Exception):
+    """The canonicalizer of a JSON task refuses a config."""
 
 
 def is_json_language(language: str) -> bool:
@@ -44,12 +57,49 @@ def canonical_config(text: str) -> Any:
     return to_float32(json5.loads(text))
 
 
-def config_key(text: str) -> Optional[str]:
-    """Return the key of a config, or None when the text does not parse."""
+def load_canonicalizer(target: str, path: Optional[str] = None) -> Canonicalizer:
+    """Import the function of a "module:function" target.
+
+    The path goes first in sys.path before the import. A relative path starts
+    at the working directory. Raise ValueError, with the target in the
+    message, when the import fails or gives no function.
+    """
+    module_name, _, function_name = target.partition(":")
+    if not module_name or not function_name:
+        raise ValueError(f"json_canonicalizer {target!r}: write module:function")
+    if path is not None and os.path.abspath(path) not in sys.path:
+        sys.path.insert(0, os.path.abspath(path))
     try:
-        return json.dumps(canonical_config(text), sort_keys=True)
+        function = getattr(importlib.import_module(module_name), function_name)
+    except Exception as error:
+        raise ValueError(
+            f"json_canonicalizer {target!r}: {type(error).__name__}: {error}"
+        ) from error
+    if not callable(function):
+        raise ValueError(f"json_canonicalizer {target!r}: not a function")
+    return function
+
+
+def config_key(
+    text: str, canonicalizer: Optional[Canonicalizer] = None
+) -> Optional[str]:
+    """Return the key of a config, or None when the text does not parse.
+
+    Without a canonicalizer, the key is the JSON text of the canonical
+    structure. With a canonicalizer, the key is the JSON text of its value for
+    the config that json5.loads gives. Raise CanonicalizerError when the
+    canonicalizer raises, or when its value has no JSON text.
+    """
+    try:
+        config = json5.loads(text)
     except ValueError:
         return None
+    if canonicalizer is None:
+        return json.dumps(to_float32(config), sort_keys=True)
+    try:
+        return json.dumps(canonicalizer(config), sort_keys=True)
+    except Exception as error:
+        raise CanonicalizerError(f"{type(error).__name__}: {error}") from error
 
 
 def config_diff(
